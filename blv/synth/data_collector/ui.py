@@ -9,8 +9,8 @@ BLV Synth Data Collector extension.  v2 redesign:
   paths automatically.
 * **Trajectory list** — dropdown of trajectories found in the project's
   trajectories folder instead of manual file path entry.
-* **Annotator info panel** — shows which annotators are active, resolution,
-  RT subframes, and frame counter.
+* **Frame sampling** — capture every Nth frame from a trajectory for sparser
+  but more diverse datasets.
 * All scattered file path inputs replaced with auto-derived paths.
 
 Sections
@@ -36,7 +36,7 @@ import omni.kit.app
 import omni.ui as ui
 
 from .asset_browser import AssetBrowser
-from .data_recorder import DataRecorder, ENABLED_ANNOTATORS
+from .data_recorder import DataRecorder
 from .gamepad_camera import GamepadCameraController
 from .trajectory import TrajectoryManager, TrajectoryPlayer, TrajectoryRecorder
 
@@ -70,10 +70,10 @@ class DataCollectorWindow:
         ) or "/World/BLV_Camera"
         default_move = settings.get_as_float(
             f"/{_ext}/default_move_speed"
-        ) or 50.0
+        ) or 60.0
         default_look = settings.get_as_float(
             f"/{_ext}/default_look_speed"
-        ) or 45.0
+        ) or 30.0
         default_w = settings.get_as_int(
             f"/{_ext}/default_resolution_width"
         ) or 1280
@@ -302,11 +302,11 @@ class DataCollectorWindow:
                         "Set", width=50, clicked_fn=self._on_set_camera_path
                     )
 
-                # Move speed — max 50.0 (v2 fix: was 20.0)
+                # Move speed
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Move Speed:", width=_LABEL_WIDTH)
                     self._widgets["move_speed"] = ui.FloatSlider(
-                        min=0.1, max=50.0
+                        min=0.1, max=200.0
                     )
                     self._widgets["move_speed"].model.set_value(
                         self._camera_ctrl.move_speed
@@ -406,21 +406,6 @@ class DataCollectorWindow:
     def _build_data_capture_section(self) -> None:
         with ui.CollapsableFrame("Data Capture", height=0):
             with ui.VStack(spacing=_SPACING):
-                # Annotator info panel
-                ui.Label("Active Annotators:", height=_FIELD_HEIGHT)
-                for ann in ENABLED_ANNOTATORS:
-                    ui.Label(f"  \u2713 {ann}", height=_FIELD_HEIGHT)
-
-                # Resolution and RT subframes readout
-                self._widgets["data_res_label"] = ui.Label(
-                    f"Resolution: {self._resolution_w} x {self._resolution_h}",
-                    height=_FIELD_HEIGHT,
-                )
-                self._widgets["data_rt_label"] = ui.Label(
-                    f"RT Subframes: {self._rt_subframes}",
-                    height=_FIELD_HEIGHT,
-                )
-
                 with ui.HStack(height=_BUTTON_HEIGHT):
                     ui.Button(
                         "Setup Writer", clicked_fn=self._on_setup_writer
@@ -443,6 +428,13 @@ class DataCollectorWindow:
                     self._widgets["rwt_traj_combo"] = ui.ComboBox(
                         0, height=_FIELD_HEIGHT
                     )
+
+                # Frame sampling — capture every Nth frame
+                with ui.HStack(height=_FIELD_HEIGHT):
+                    ui.Label("Capture every:", width=_LABEL_WIDTH)
+                    self._widgets["rwt_frame_step"] = ui.IntField(width=60)
+                    self._widgets["rwt_frame_step"].model.set_value(1)
+                    ui.Label(" frames  (1 = every frame)", width=180)
 
                 with ui.HStack(height=_BUTTON_HEIGHT):
                     ui.Button(
@@ -765,10 +757,19 @@ class DataCollectorWindow:
             carb.log_error(f"[BLV] record_with_trajectory setup error: {exc}")
             return
 
-        self._widgets["rwt_status"].text = f"Recording 0/{total}..."
+        # Read frame step from UI
+        frame_step = max(1, self._widgets["rwt_frame_step"].model.get_value_as_int())
+        sampled_indices = list(range(0, total, frame_step))
+        n_captures = len(sampled_indices)
+
+        self._widgets["rwt_status"].text = (
+            f"Recording 0/{n_captures} (sampling every {frame_step} of {total} frames)..."
+        )
 
         try:
-            for i, frame_data in enumerate(frames):
+            for capture_idx, frame_idx in enumerate(sampled_indices):
+                frame_data = frames[frame_idx]
+
                 # 1. Set camera pose
                 self._camera_ctrl.set_pose(
                     frame_data["position"], frame_data["rotation"]
@@ -781,10 +782,11 @@ class DataCollectorWindow:
                 await recorder.capture_frame()
 
                 # Update progress UI
-                progress = (i + 1) / total
+                progress = (capture_idx + 1) / n_captures
                 self._widgets["rwt_progress"].model.set_value(progress)
                 self._widgets["rwt_status"].text = (
-                    f"Recording {i + 1}/{total}..."
+                    f"Recording {capture_idx + 1}/{n_captures} "
+                    f"(frame {frame_idx}/{total})..."
                 )
 
         except asyncio.CancelledError:
@@ -882,8 +884,10 @@ class DataCollectorWindow:
         """Lightweight per-frame callback to keep status labels current."""
         # Camera controller status
         if self._camera_ctrl.is_enabled:
+            slow = "ON" if self._camera_ctrl.slow_mode else "OFF"
             self._widgets["cam_status"].text = (
-                f"Status: Enabled | Speed: {self._camera_ctrl.move_speed:.1f} m/s"
+                f"Status: Enabled | Speed: {self._camera_ctrl.move_speed:.1f} m/s | "
+                f"Slow: {slow}"
             )
             # Sync the slider if speed changed via D-pad
             self._widgets["move_speed"].model.set_value(self._camera_ctrl.move_speed)
