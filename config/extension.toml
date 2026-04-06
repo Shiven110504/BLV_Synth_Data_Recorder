@@ -1,0 +1,42 @@
+[package]
+version = "2.0.0"
+title = "BLV Synth Data Collector"
+description = "Synthetic data collection tool for BLV (blind/low-vision) accessibility object detection. Provides gamepad-driven FPS camera control, trajectory recording/playback, Replicator-based multi-modal data capture (RGB, semantic segmentation, bounding boxes), and USD asset browsing with automatic semantic labeling."
+authors = ["Shiven Patel"]
+category = "Simulation"
+keywords = ["synthetic data", "BLV", "accessibility", "data collection", "gamepad", "replicator", "isaac sim"]
+readme = "docs/README.md"
+
+# This extension targets Isaac Sim 5.1.0 / Kit 107.3.3
+# GPU: RTX 5090, Controller: Logitech F710 (XInput)
+
+[[python.module]]
+name = "blv.synth.data_collector"
+
+[dependencies]
+# Core Kit / UI
+"omni.kit.uiapp" = {}
+"omni.ui" = {}
+"omni.usd" = {}
+
+# Viewport interaction
+"omni.kit.viewport.utility" = {}
+
+# Replicator for synthetic data capture
+"omni.replicator.core" = {}
+
+# Isaac Sim core utilities (semantics helpers, etc.)
+"isaacsim.core.api" = {}
+"isaacsim.core.utils" = {}
+
+# ---------- extension-level settings ----------
+# These defaults can be overridden in the user's omniverse config or at runtime.
+[settings]
+exts."blv.synth.data_collector".default_camera_path = "/World/BLV_Camera"
+exts."blv.synth.data_collector".default_move_speed = 5.0
+exts."blv.synth.data_collector".default_look_speed = 45.0
+exts."blv.synth.data_collector".default_resolution_width = 1280
+exts."blv.synth.data_collector".default_resolution_height = 720
+exts."blv.synth.data_collector".default_rt_subframes = 4
+exts."blv.synth.data_collector".default_root_folder = "~/blv_data"
+exts."blv.synth.data_collector".default_environment = "hospital_hallway"
