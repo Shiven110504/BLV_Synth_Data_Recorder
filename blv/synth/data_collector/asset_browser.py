@@ -81,14 +81,9 @@ class AssetBrowser:
 
     @property
     def current_asset_name(self) -> str:
-        """Display name of the currently loaded asset, or ``"None"``.
-
-        When assets live in subdirectories (e.g. ``{name}/asset.usdz``) the
-        parent directory name is used because the filename alone (``asset``)
-        is not unique.
-        """
+        """Basename of the currently loaded asset, or ``"None"``."""
         if 0 <= self._current_index < len(self._assets):
-            return self._asset_display_name(self._assets[self._current_index])
+            return os.path.basename(self._assets[self._current_index])
         return "None"
 
     @property
@@ -100,28 +95,10 @@ class AssetBrowser:
 
     @property
     def current_asset_stem(self) -> str:
-        """Unique stem identifier for the currently loaded asset.
-
-        Uses the parent directory name when the filename is generic
-        (e.g. ``asset.usdz``).
-        """
+        """Filename without extension of the currently loaded asset."""
         if 0 <= self._current_index < len(self._assets):
-            return self._asset_display_name(self._assets[self._current_index])
+            return os.path.splitext(os.path.basename(self._assets[self._current_index]))[0]
         return ""
-
-    def _asset_display_name(self, asset_path: str) -> str:
-        """Return a meaningful display name for *asset_path*.
-
-        If the file sits directly in the scanned folder, use its stem.
-        Otherwise use the immediate parent directory name (which is typically
-        the unique identifier when every file is named ``asset.usdz``).
-        """
-        parent = os.path.dirname(asset_path)
-        if os.path.normpath(parent) == os.path.normpath(self._asset_folder):
-            # File is directly in the scanned folder — use its stem
-            return os.path.splitext(os.path.basename(asset_path))[0]
-        # File is in a subdirectory — use the directory name
-        return os.path.basename(parent)
 
     @property
     def class_name(self) -> str:
@@ -167,33 +144,16 @@ class AssetBrowser:
         if class_name is not None:
             self._class_name = class_name
 
-        carb.log_warn(f"[BLV][DEBUG] set_folder: folder_path='{folder_path}'")
-        carb.log_warn(f"[BLV][DEBUG] set_folder: isdir={os.path.isdir(folder_path)}")
+        carb.log_info(f"[BLV] AssetBrowser scanning '{folder_path}' (isdir={os.path.isdir(folder_path)})")
 
-        # Collect and sort all matching files — search recursively so that
-        # assets inside subdirectories (e.g. {asset_name}/asset.usdz) are found.
+        # Collect and sort all matching files — flat scan, no recursion.
+        # Assets are expected directly inside *folder_path* (not nested).
         self._assets = sorted(
             path
             for ext in self.USD_EXTENSIONS
-            for path in _glob.glob(os.path.join(folder_path, "**", ext), recursive=True)
+            for path in _glob.glob(os.path.join(folder_path, ext))
         )
         self._current_index = -1
-
-        # Debug: show what glob patterns matched
-        for ext in self.USD_EXTENSIONS:
-            flat_pattern = os.path.join(folder_path, ext)
-            recursive_pattern = os.path.join(folder_path, "**", ext)
-            flat_matches = _glob.glob(flat_pattern)
-            recursive_matches = _glob.glob(recursive_pattern, recursive=True)
-            carb.log_warn(
-                f"[BLV][DEBUG] glob flat('{flat_pattern}') → {len(flat_matches)}, "
-                f"recursive('{recursive_pattern}') → {len(recursive_matches)} matches"
-            )
-            if recursive_matches:
-                for m in recursive_matches[:3]:
-                    carb.log_warn(f"[BLV][DEBUG]   sample: {m}")
-                if len(recursive_matches) > 3:
-                    carb.log_warn(f"[BLV][DEBUG]   ... and {len(recursive_matches) - 3} more")
 
         carb.log_info(
             f"[BLV] AssetBrowser scanned '{folder_path}' — "
@@ -261,12 +221,6 @@ class AssetBrowser:
             return False
 
         asset_path = self._assets[index]
-        carb.log_warn(f"[BLV][DEBUG] load_asset: index={index}")
-        carb.log_warn(f"[BLV][DEBUG] load_asset: asset_path='{asset_path}'")
-        carb.log_warn(f"[BLV][DEBUG] load_asset: file_exists={os.path.isfile(asset_path)}")
-        carb.log_warn(f"[BLV][DEBUG] load_asset: target_prim_path='{self._target_prim_path}'")
-        carb.log_warn(f"[BLV][DEBUG] load_asset: class_name='{self._class_name}'")
-
         stage: Usd.Stage = omni.usd.get_context().get_stage()
         if stage is None:
             carb.log_error("[BLV] No USD stage available.")
@@ -274,19 +228,15 @@ class AssetBrowser:
 
         # Ensure target prim path is a valid absolute USD path
         if not self._target_prim_path or not self._target_prim_path.startswith("/"):
-            old_path = self._target_prim_path
             self._target_prim_path = "/World/" + (self._target_prim_path or "TargetAsset")
             carb.log_warn(
-                f"[BLV][DEBUG] Target prim path was not absolute: '{old_path}' "
-                f"→ auto-corrected to '{self._target_prim_path}'"
+                f"[BLV] Target prim path was not absolute — auto-corrected to "
+                f"'{self._target_prim_path}'"
             )
 
         # Ensure the target prim exists (create an Xform if not)
         prim = stage.GetPrimAtPath(self._target_prim_path)
         if not prim.IsValid():
-            carb.log_warn(
-                f"[BLV][DEBUG] Prim not found at '{self._target_prim_path}', creating Xform..."
-            )
             prim = stage.DefinePrim(self._target_prim_path, "Xform")
             carb.log_info(f"[BLV] Created target prim at {self._target_prim_path}")
 
@@ -295,9 +245,7 @@ class AssetBrowser:
             # new one.  This cleanly swaps to a different asset file.
             refs = prim.GetReferences()
             refs.ClearReferences()
-            carb.log_warn(f"[BLV][DEBUG] Adding reference: '{asset_path}'")
             refs.AddReference(asset_path)
-            carb.log_warn(f"[BLV][DEBUG] Reference added successfully")
         except Exception as exc:
             carb.log_error(f"[BLV] Failed to set reference on {self._target_prim_path}: {exc}")
             return False

@@ -204,21 +204,7 @@ class DataRecorder:
             rep.orchestrator.set_capture_on_play(False)
 
             # --- BasicWriter ---
-            self._writer = rep.writers.get("BasicWriter")
-            ann = self._annotators
-            self._writer.initialize(
-                output_dir=output_dir,
-                rgb=ann.get("rgb", True),
-                semantic_segmentation=ann.get("semantic_segmentation", True),
-                colorize_semantic_segmentation=ann.get("colorize_semantic_segmentation", True),
-                bounding_box_2d_tight=ann.get("bounding_box_2d_tight", True),
-                bounding_box_2d_loose=ann.get("bounding_box_2d_loose", False),
-                bounding_box_3d=ann.get("bounding_box_3d", False),
-                instance_segmentation=ann.get("instance_segmentation", False),
-                normals=ann.get("normals", False),
-                distance_to_image_plane=ann.get("distance_to_image_plane", False),
-                frame_padding=self.FRAME_PADDING,
-            )
+            self._writer = self._build_writer(output_dir)
             self._writer.attach([self._render_product])
 
             self._frame_count = 0
@@ -233,6 +219,61 @@ class DataRecorder:
             # Attempt partial cleanup
             self._cleanup_partial()
             raise
+
+    def _build_writer(self, output_dir: str):
+        """Create and initialise a fresh BasicWriter using *self._annotators*."""
+        writer = rep.writers.get("BasicWriter")
+        ann = self._annotators
+        writer.initialize(
+            output_dir=output_dir,
+            rgb=ann.get("rgb", True),
+            semantic_segmentation=ann.get("semantic_segmentation", True),
+            colorize_semantic_segmentation=ann.get("colorize_semantic_segmentation", True),
+            bounding_box_2d_tight=ann.get("bounding_box_2d_tight", True),
+            bounding_box_2d_loose=ann.get("bounding_box_2d_loose", False),
+            bounding_box_3d=ann.get("bounding_box_3d", False),
+            instance_segmentation=ann.get("instance_segmentation", False),
+            normals=ann.get("normals", False),
+            distance_to_image_plane=ann.get("distance_to_image_plane", False),
+            frame_padding=self.FRAME_PADDING,
+        )
+        return writer
+
+    def reinitialize_writer(self, output_dir: str) -> None:
+        """Swap the BasicWriter to a new *output_dir* without destroying the
+        render product.
+
+        This is the safe way to start a new recording session without
+        tearing down and recreating the render product — which, due to
+        Replicator's internal OmniGraph state, can leave stale node
+        handles and cause ``Invalid NodeObj`` errors on the next setup.
+        """
+        if not self._is_setup or self._render_product is None:
+            carb.log_warn(
+                "[BLV] reinitialize_writer called but recorder is not set up; "
+                "falling back to full setup()."
+            )
+            self.setup(output_dir, rt_subframes=self._rt_subframes)
+            return
+
+        self._output_dir = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Detach old writer and drop its reference
+        if self._writer is not None:
+            try:
+                self._writer.detach()
+            except Exception as exc:
+                carb.log_warn(f"[BLV] Writer detach warning during reinit: {exc}")
+            self._writer = None
+
+        # Build a fresh writer and attach to the still-alive render product
+        self._writer = self._build_writer(output_dir)
+        self._writer.attach([self._render_product])
+        self._frame_count = 0
+        carb.log_info(
+            f"[BLV] DataRecorder writer reinitialised → output={output_dir}"
+        )
 
     async def capture_frame(self) -> None:
         """Capture a single frame (async).

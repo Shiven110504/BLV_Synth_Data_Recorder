@@ -70,6 +70,7 @@ class GamepadCameraController:
         camera_prim_path: str = "/World/BLV_Camera",
         move_speed: Optional[float] = None,
         look_speed: Optional[float] = None,
+        focal_length: Optional[float] = None,
     ) -> None:
         settings = carb.settings.get_settings()
         _ext = "exts.blv.synth.data_collector"
@@ -85,6 +86,10 @@ class GamepadCameraController:
             or settings.get_as_float(f"/{_ext}/default_look_speed")
             or self.DEFAULT_LOOK_SPEED
         )
+        # Focal length in mm. USD stores it in "tenths of a scene unit" but
+        # UsdGeom.Camera.GetFocalLengthAttr conventionally takes mm directly
+        # in Isaac Sim's default cm-scaled stage.
+        self._focal_length: Optional[float] = focal_length
 
         self._enabled: bool = False
         self._slow_mode: bool = False
@@ -191,6 +196,25 @@ class GamepadCameraController:
         self._look_speed = max(self.MIN_LOOK_SPEED, val)
 
     @property
+    def focal_length(self) -> Optional[float]:
+        return self._focal_length
+
+    @focal_length.setter
+    def focal_length(self, val: Optional[float]) -> None:
+        self._focal_length = val
+        # Apply immediately if camera already exists
+        if val is not None:
+            stage = omni.usd.get_context().get_stage()
+            if stage is not None:
+                prim = stage.GetPrimAtPath(self._camera_path)
+                if prim.IsValid():
+                    try:
+                        UsdGeom.Camera(prim).GetFocalLengthAttr().Set(float(val))
+                        carb.log_info(f"[BLV] Camera focal length → {val} mm")
+                    except Exception as exc:
+                        carb.log_warn(f"[BLV] Failed to update focal length: {exc}")
+
+    @property
     def slow_mode(self) -> bool:
         return self._slow_mode
 
@@ -227,6 +251,18 @@ class GamepadCameraController:
             cam = UsdGeom.Camera.Define(stage, self._camera_path)
             prim = cam.GetPrim()
             carb.log_info(f"[BLV] Created camera prim at {self._camera_path}")
+        else:
+            cam = UsdGeom.Camera(prim)
+
+        # Apply focal length if configured
+        if self._focal_length is not None and cam:
+            try:
+                cam.GetFocalLengthAttr().Set(float(self._focal_length))
+                carb.log_info(
+                    f"[BLV] Camera focal length set to {self._focal_length} mm"
+                )
+            except Exception as exc:
+                carb.log_warn(f"[BLV] Failed to set focal length: {exc}")
 
         # Required xformOps for a Z-up FPS camera:
         #   xformOp:translate  → position

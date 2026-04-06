@@ -12,6 +12,7 @@ environment: "hospital_hallway"
 camera_path: "/World/BLV_Camera"
 move_speed: 60.0
 look_speed: 30.0
+focal_length: 28.0   # in mm — USD uses "tenths of a scene unit"; see camera setup
 
 # --- Rendering ---
 resolution_width: 1280
@@ -19,7 +20,10 @@ resolution_height: 720
 rt_subframes: 4
 
 # --- Asset Browser ---
-asset_folder: ""
+# asset_root_folder is the parent directory; the class name below is also
+# the subfolder inside it, so assets are scanned at:
+#   {asset_root_folder}/{asset_class_name}/*.usd*
+asset_root_folder: ""
 asset_class_name: ""
 target_prim_path: "/World/TargetAsset"
 

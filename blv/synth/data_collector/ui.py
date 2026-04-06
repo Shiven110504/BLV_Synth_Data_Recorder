@@ -102,6 +102,9 @@ class DataCollectorWindow:
         default_look = cfg.get("look_speed") or settings.get_as_float(
             f"/{_ext}/default_look_speed"
         ) or 30.0
+        default_focal = cfg.get("focal_length") or settings.get_as_float(
+            f"/{_ext}/default_focal_length"
+        ) or 28.0
         default_w = cfg.get("resolution_width") or settings.get_as_int(
             f"/{_ext}/default_resolution_width"
         ) or 1280
@@ -119,7 +122,13 @@ class DataCollectorWindow:
         ) or "hospital_hallway"
 
         # Asset browser defaults from YAML
-        default_asset_folder = cfg.get("asset_folder", "")
+        # New semantics: asset_root_folder is the parent dir, class_name is
+        # the subfolder containing the USD files. Falls back to legacy
+        # 'asset_folder' key for backwards compat with older configs.
+        default_asset_root = (
+            cfg.get("asset_root_folder")
+            or cfg.get("asset_folder", "")
+        )
         default_asset_class = cfg.get("asset_class_name", "")
         default_target_prim = cfg.get("target_prim_path", "/World/TargetAsset")
 
@@ -133,6 +142,7 @@ class DataCollectorWindow:
             camera_prim_path=default_cam,
             move_speed=default_move,
             look_speed=default_look,
+            focal_length=default_focal,
         )
         self._traj_recorder = TrajectoryRecorder(self._camera_ctrl)
         self._traj_player = TrajectoryPlayer(self._camera_ctrl)
@@ -153,9 +163,10 @@ class DataCollectorWindow:
         self._rt_subframes: int = default_rt
 
         # Asset browser defaults from config
-        self._default_asset_folder: str = default_asset_folder
+        self._default_asset_root: str = default_asset_root
         self._default_asset_class: str = default_asset_class
         self._default_target_prim: str = default_target_prim
+        self._default_focal_length: float = default_focal
 
         # Async task handle for "Record with Trajectory"
         self._record_traj_task: Optional[asyncio.Task] = None
@@ -538,15 +549,16 @@ class DataCollectorWindow:
         with ui.CollapsableFrame("Asset Browser", height=0):
             with ui.VStack(spacing=_SPACING):
                 with ui.HStack(height=_FIELD_HEIGHT):
-                    ui.Label("Asset Folder:", width=_LABEL_WIDTH)
+                    ui.Label("Asset Root:", width=_LABEL_WIDTH)
                     self._widgets["ab_folder"] = ui.StringField()
-                    self._widgets["ab_folder"].model.set_value(self._default_asset_folder)
+                    self._widgets["ab_folder"].model.set_value(self._default_asset_root)
                     ui.Button("...", width=30, clicked_fn=self._on_browse_asset_folder)
 
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Class Name:", width=_LABEL_WIDTH)
                     self._widgets["ab_class"] = ui.StringField()
                     self._widgets["ab_class"].model.set_value(self._default_asset_class)
+                    ui.Label("(= subfolder)", width=100)
 
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Target Prim:", width=_LABEL_WIDTH)
@@ -711,10 +723,27 @@ class DataCollectorWindow:
     # ================================================================= #
 
     def _on_setup_writer(self) -> None:
-        output_dir = self._get_capture_output_dir()
-        if not output_dir:
-            carb.log_warn("[BLV] Cannot determine output directory.")
+        """Manual "Setup Writer" button.
+
+        Requires a class and asset to be selected in the Asset Browser so
+        the output path stays consistent with record-with-trajectory and
+        we don't scatter files in the environment folder.
+        """
+        class_name = self._asset_browser.class_name
+        asset_stem = self._asset_browser.current_asset_stem
+        if not class_name or not asset_stem:
+            msg = (
+                "Set Class Name and load an asset in the Asset Browser "
+                "before setting up the writer."
+            )
+            self._widgets["data_status"].text = f"Error: {msg}"
+            carb.log_warn(f"[BLV] {msg}")
             return
+
+        output_dir = self._get_capture_output_dir(
+            class_name=class_name,
+            asset_name=asset_stem,
+        )
 
         w = self._widgets["res_w"].model.get_value_as_int()
         h = self._widgets["res_h"].model.get_value_as_int()
@@ -723,7 +752,10 @@ class DataCollectorWindow:
         self._data_recorder.resolution = (w, h)
 
         try:
-            self._data_recorder.setup(output_dir, rt_subframes=rt)
+            if self._data_recorder.is_setup:
+                self._data_recorder.reinitialize_writer(output_dir)
+            else:
+                self._data_recorder.setup(output_dir, rt_subframes=rt)
             self._widgets["data_status"].text = (
                 f"Status: Writer Ready | Frames: 0"
             )
@@ -760,6 +792,14 @@ class DataCollectorWindow:
         # Build output dir from project settings + asset info
         class_name = self._asset_browser.class_name
         asset_stem = self._asset_browser.current_asset_stem
+        if not class_name or not asset_stem:
+            msg = (
+                "Set Class Name and load an asset in the Asset Browser "
+                "before recording."
+            )
+            self._widgets["rwt_status"].text = f"Error: {msg}"
+            carb.log_warn(f"[BLV] {msg}")
+            return
         traj_stem = os.path.splitext(traj_name)[0]
         output_dir = self._get_capture_output_dir(
             class_name=class_name,
@@ -778,14 +818,17 @@ class DataCollectorWindow:
         )
 
     def _on_cancel_record_with_trajectory(self) -> None:
-        """Cancel a running record-with-trajectory session."""
+        """Cancel a running record-with-trajectory session.
+
+        We do NOT teardown the DataRecorder here — the render product stays
+        alive so the next "Record Trajectory" run can swap writers cheaply
+        via reinitialize_writer().  The user can click the Teardown button
+        in the Data Capture section if they want a full reset.
+        """
         if self._record_traj_task is not None and not self._record_traj_task.done():
             self._record_traj_task.cancel()
             carb.log_info("[BLV] Record-with-trajectory cancelled by user.")
             self._widgets["rwt_status"].text = "Cancelled"
-        # Ensure the data recorder is cleaned up even on cancel
-        if self._data_recorder.is_setup:
-            self._data_recorder.teardown()
 
     async def _record_with_trajectory_async(
         self,
@@ -818,16 +861,25 @@ class DataCollectorWindow:
             self._widgets["rwt_status"].text = "Error: trajectory has 0 frames"
             return
 
-        # Setup a fresh DataRecorder for this session
-        recorder = DataRecorder(
-            camera_path=self._camera_ctrl.camera_path,
-            resolution=resolution,
-            annotators=self._annotator_cfg,
-        )
+        # Reuse the persistent self._data_recorder across sessions.  Creating
+        # a fresh DataRecorder every recording session and tearing down the
+        # render product leaves Replicator's OmniGraph holding stale node
+        # handles, which surfaces as "Invalid NodeObj" on the next setup.
+        # By keeping one render product alive and only swapping the writer,
+        # we sidestep that entirely.
+        recorder = self._data_recorder
+        recorder.camera_path = self._camera_ctrl.camera_path
+        if not recorder.is_setup:
+            recorder.resolution = resolution
+            recorder.annotators = self._annotator_cfg
 
         self._widgets["rwt_status"].text = "Setting up writer..."
         try:
-            recorder.setup(output_dir, rt_subframes=rt_subframes)
+            if recorder.is_setup:
+                # Fast path: keep render product, just swap the writer's output dir
+                recorder.reinitialize_writer(output_dir)
+            else:
+                recorder.setup(output_dir, rt_subframes=rt_subframes)
         except Exception as exc:
             self._widgets["rwt_status"].text = f"Writer setup failed: {exc}"
             carb.log_error(f"[BLV] record_with_trajectory setup error: {exc}")
@@ -869,10 +921,11 @@ class DataCollectorWindow:
             carb.log_info("[BLV] record_with_trajectory was cancelled.")
             self._widgets["rwt_status"].text = "Cancelled"
         except Exception as exc:
-            carb.log_error(f"[BLV] record_with_trajectory error at frame {i}: {exc}")
-            self._widgets["rwt_status"].text = f"Error at frame {i}: {exc}"
-        finally:
-            recorder.teardown()
+            carb.log_error(f"[BLV] record_with_trajectory error: {exc}")
+            self._widgets["rwt_status"].text = f"Error: {exc}"
+        # Note: we deliberately do NOT teardown the recorder here.  The render
+        # product is kept alive so the next recording session can reuse it
+        # via reinitialize_writer() — see the comment above near setup.
 
         captured = recorder.frame_count
         self._widgets["rwt_status"].text = (
@@ -895,42 +948,61 @@ class DataCollectorWindow:
         if folder:
             self._scan_asset_folder(folder)
 
-    def _scan_asset_folder(self, folder: str) -> None:
-        """Scan an asset folder and update the browser."""
+    def _scan_asset_folder(self, root_folder: str) -> None:
+        """Scan ``{root_folder}/{class_name}/`` for USD files.
+
+        The asset browser expects a **root** directory that contains one
+        subfolder per class (e.g. ``root/elevator_button/*.usdz``).  The
+        class name comes from the "Class Name" field and doubles as the
+        semantic label applied to loaded assets.
+        """
         cls = self._widgets["ab_class"].model.get_value_as_string().strip()
         target = self._widgets["ab_target"].model.get_value_as_string().strip()
 
-        carb.log_warn(f"[BLV][DEBUG] _scan_asset_folder: raw folder='{folder}'")
-        carb.log_warn(f"[BLV][DEBUG] _scan_asset_folder: class='{cls}', target='{target}'")
+        # Normalize the root, then compose the actual scan folder
+        root_folder = os.path.normpath(os.path.expanduser(root_folder))
+        if not cls:
+            carb.log_warn("[BLV] Class Name is empty — cannot scan assets.")
+            self._widgets["ab_status"].text = "Error: set Class Name first"
+            return
 
-        # Normalize path to resolve ~, double slashes, trailing slashes, etc.
-        folder = os.path.normpath(os.path.expanduser(folder))
-        carb.log_warn(f"[BLV][DEBUG] _scan_asset_folder: normalized='{folder}'")
+        scan_folder = os.path.join(root_folder, cls)
+        carb.log_info(
+            f"[BLV] Scanning assets: root='{root_folder}', class='{cls}' → '{scan_folder}'"
+        )
 
-        if not folder or not os.path.isdir(folder):
-            carb.log_warn(f"[BLV] Invalid asset folder: '{folder}'")
-            self._widgets["ab_status"].text = "Error: invalid folder"
+        if not os.path.isdir(scan_folder):
+            carb.log_warn(f"[BLV] Invalid asset folder: '{scan_folder}'")
+            self._widgets["ab_status"].text = f"Error: {scan_folder} not found"
             return
 
         self._asset_browser.set_target_prim(target)
-        count = self._asset_browser.set_folder(folder, class_name=cls)
+        count = self._asset_browser.set_folder(scan_folder, class_name=cls)
         self._widgets["ab_status"].text = f"Found {count} USD files"
         self._widgets["ab_current"].text = "Current: None"
 
+    def _expected_scan_folder(self) -> str:
+        """Compose the expected scan folder from the UI root + class fields."""
+        root = self._widgets["ab_folder"].model.get_value_as_string().strip()
+        cls = self._widgets["ab_class"].model.get_value_as_string().strip()
+        if not root or not cls:
+            return ""
+        return os.path.normpath(os.path.join(os.path.expanduser(root), cls))
+
     def _on_next_asset(self) -> None:
-        # Auto-scan if folder was changed
-        folder = self._widgets["ab_folder"].model.get_value_as_string().strip()
-        if folder and folder != self._asset_browser.asset_folder:
-            self._scan_asset_folder(folder)
+        # Auto-scan if root or class changed since the last scan
+        root = self._widgets["ab_folder"].model.get_value_as_string().strip()
+        if self._expected_scan_folder() != self._asset_browser.asset_folder:
+            self._scan_asset_folder(root)
 
         self._sync_asset_browser_fields()
         success = self._asset_browser.next_asset()
         self._update_asset_browser_labels(success)
 
     def _on_prev_asset(self) -> None:
-        folder = self._widgets["ab_folder"].model.get_value_as_string().strip()
-        if folder and folder != self._asset_browser.asset_folder:
-            self._scan_asset_folder(folder)
+        root = self._widgets["ab_folder"].model.get_value_as_string().strip()
+        if self._expected_scan_folder() != self._asset_browser.asset_folder:
+            self._scan_asset_folder(root)
 
         self._sync_asset_browser_fields()
         success = self._asset_browser.previous_asset()
