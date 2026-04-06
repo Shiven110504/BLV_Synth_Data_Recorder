@@ -70,7 +70,7 @@ class DataCollectorWindow:
         ) or "/World/BLV_Camera"
         default_move = settings.get_as_float(
             f"/{_ext}/default_move_speed"
-        ) or 5.0
+        ) or 50.0
         default_look = settings.get_as_float(
             f"/{_ext}/default_look_speed"
         ) or 45.0
@@ -882,10 +882,8 @@ class DataCollectorWindow:
         """Lightweight per-frame callback to keep status labels current."""
         # Camera controller status
         if self._camera_ctrl.is_enabled:
-            slow = "ON" if self._camera_ctrl.slow_mode else "OFF"
             self._widgets["cam_status"].text = (
-                f"Status: Enabled | Speed: {self._camera_ctrl.move_speed:.1f} m/s | "
-                f"Slow: {slow}"
+                f"Status: Enabled | Speed: {self._camera_ctrl.move_speed:.1f} m/s"
             )
             # Sync the slider if speed changed via D-pad
             self._widgets["move_speed"].model.set_value(self._camera_ctrl.move_speed)

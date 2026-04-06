@@ -33,7 +33,7 @@ name = "blv.synth.data_collector"
 # These defaults can be overridden in the user's omniverse config or at runtime.
 [settings]
 exts."blv.synth.data_collector".default_camera_path = "/World/BLV_Camera"
-exts."blv.synth.data_collector".default_move_speed = 5.0
+exts."blv.synth.data_collector".default_move_speed = 50.0
 exts."blv.synth.data_collector".default_look_speed = 45.0
 exts."blv.synth.data_collector".default_resolution_width = 1280
 exts."blv.synth.data_collector".default_resolution_height = 720
