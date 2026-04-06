@@ -369,7 +369,9 @@ class TrajectoryManager:
 
     # ---- Public API -------------------------------------------------- #
 
-    def set_project_paths(self, root_folder: str, environment: str) -> str:
+    def set_project_paths(
+        self, root_folder: str, environment: str, class_name: str = ""
+    ) -> str:
         """Set the trajectory directory from project settings.
 
         Parameters
@@ -378,6 +380,9 @@ class TrajectoryManager:
             Project root folder (e.g. ``~/blv_data``).
         environment : str
             Environment name (e.g. ``hospital_hallway``).
+        class_name : str, optional
+            Asset class name.  When provided the directory becomes
+            ``{root}/{class}/{env}/trajectories/``.
 
         Returns
         -------
@@ -385,7 +390,11 @@ class TrajectoryManager:
             The resolved trajectory directory path.
         """
         expanded = os.path.expanduser(root_folder)
-        self._directory = os.path.join(expanded, environment, "trajectories")
+        parts = [expanded]
+        if class_name:
+            parts.append(class_name)
+        parts += [environment, "trajectories"]
+        self._directory = os.path.join(*parts)
         os.makedirs(self._directory, exist_ok=True)
         carb.log_info(f"[BLV] TrajectoryManager directory → {self._directory}")
         return self._directory

@@ -214,12 +214,24 @@ class DataCollectorWindow:
     # ================================================================= #
 
     def _apply_project_paths(self) -> None:
-        """Derive all paths from root folder + environment and push to modules."""
+        """Derive all paths from root folder + environment and push to modules.
+
+        Trajectory dir follows the same class/env structure::
+
+            {root}/{class}/{environment}/trajectories/
+
+        Falls back to ``{root}/{environment}/trajectories/`` when no class is set.
+        """
         root = os.path.expanduser(self._root_folder)
         env = self._environment
 
+        # Use class from asset browser if available
+        cls = ""
+        if "ab_class" in self._widgets:
+            cls = self._widgets["ab_class"].model.get_value_as_string().strip()
+
         # Trajectory manager
-        self._traj_manager.set_project_paths(root, env)
+        self._traj_manager.set_project_paths(root, env, class_name=cls)
 
         # Refresh trajectory list in UI
         self._refresh_trajectory_lists()
@@ -232,15 +244,24 @@ class DataCollectorWindow:
     ) -> str:
         """Build the capture output directory from project settings.
 
-        Structure: {root}/{environment}/captures/{class}_{asset}/{traj}/
+        Structure::
+
+            {root}/{class}/{environment}/{asset}/{trajectory}/
+
+        Example::
+
+            ~/SDG/Synth_Data/elevator_button/hospital_hallway/
+                ElavatorRequestButtons01_Low_A/trajectory_001/
         """
         root = os.path.expanduser(self._root_folder)
         env = self._environment
-        parts = [root, env, "captures"]
-        if class_name and asset_name:
-            parts.append(f"{class_name}_{asset_name}")
-        elif class_name:
+        parts = [root]
+        if class_name:
             parts.append(class_name)
+        if env:
+            parts.append(env)
+        if asset_name:
+            parts.append(asset_name)
         if traj_name:
             parts.append(traj_name)
         return os.path.join(*parts)
@@ -879,8 +900,12 @@ class DataCollectorWindow:
         cls = self._widgets["ab_class"].model.get_value_as_string().strip()
         target = self._widgets["ab_target"].model.get_value_as_string().strip()
 
+        carb.log_warn(f"[BLV][DEBUG] _scan_asset_folder: raw folder='{folder}'")
+        carb.log_warn(f"[BLV][DEBUG] _scan_asset_folder: class='{cls}', target='{target}'")
+
         # Normalize path to resolve ~, double slashes, trailing slashes, etc.
         folder = os.path.normpath(os.path.expanduser(folder))
+        carb.log_warn(f"[BLV][DEBUG] _scan_asset_folder: normalized='{folder}'")
 
         if not folder or not os.path.isdir(folder):
             carb.log_warn(f"[BLV] Invalid asset folder: '{folder}'")

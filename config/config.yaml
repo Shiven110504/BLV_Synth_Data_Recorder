@@ -5,7 +5,7 @@
 # at runtime through the UI.
 
 # --- Project ---
-root_folder: "~/blv_data"
+root_folder: "/home/shiven/Desktop/SDG/Synth_Data"
 environment: "hospital_hallway"
 
 # --- Camera ---
