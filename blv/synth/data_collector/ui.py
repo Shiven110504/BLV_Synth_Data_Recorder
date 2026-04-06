@@ -28,17 +28,42 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import carb
 import carb.settings
 import omni.kit.app
 import omni.ui as ui
+import yaml
 
 from .asset_browser import AssetBrowser
-from .data_recorder import DataRecorder
+from .data_recorder import DEFAULT_ANNOTATORS, DataRecorder, get_enabled_annotator_names
 from .gamepad_camera import GamepadCameraController
 from .trajectory import TrajectoryManager, TrajectoryPlayer, TrajectoryRecorder
+
+
+def _load_yaml_config() -> Dict[str, Any]:
+    """Load the user config YAML shipped next to the extension.toml.
+
+    Returns an empty dict if the file is missing or unparseable.
+    """
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)
+        )))),
+        "config", "config.yaml",
+    )
+    if not os.path.isfile(config_path):
+        carb.log_info(f"[BLV] No config.yaml found at {config_path} — using defaults.")
+        return {}
+    try:
+        with open(config_path, "r") as fh:
+            data = yaml.safe_load(fh)
+        carb.log_info(f"[BLV] Loaded config from {config_path}")
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        carb.log_warn(f"[BLV] Failed to parse config.yaml: {exc}")
+        return {}
 
 # ===================================================================== #
 #  Styling constants                                                     #
@@ -61,34 +86,47 @@ class DataCollectorWindow:
     """
 
     def __init__(self) -> None:
-        # ---- Read extension settings --------------------------------- #
+        # ---- Load YAML config (overrides extension.toml defaults) ---- #
+        cfg = _load_yaml_config()
+
+        # ---- Read extension settings (fallback) ---------------------- #
         settings = carb.settings.get_settings()
         _ext = "exts.blv.synth.data_collector"
 
-        default_cam = settings.get_as_string(
+        default_cam = cfg.get("camera_path") or settings.get_as_string(
             f"/{_ext}/default_camera_path"
         ) or "/World/BLV_Camera"
-        default_move = settings.get_as_float(
+        default_move = cfg.get("move_speed") or settings.get_as_float(
             f"/{_ext}/default_move_speed"
         ) or 60.0
-        default_look = settings.get_as_float(
+        default_look = cfg.get("look_speed") or settings.get_as_float(
             f"/{_ext}/default_look_speed"
         ) or 30.0
-        default_w = settings.get_as_int(
+        default_w = cfg.get("resolution_width") or settings.get_as_int(
             f"/{_ext}/default_resolution_width"
         ) or 1280
-        default_h = settings.get_as_int(
+        default_h = cfg.get("resolution_height") or settings.get_as_int(
             f"/{_ext}/default_resolution_height"
         ) or 720
-        default_rt = settings.get_as_int(
+        default_rt = cfg.get("rt_subframes") or settings.get_as_int(
             f"/{_ext}/default_rt_subframes"
         ) or 4
-        default_root = settings.get_as_string(
+        default_root = cfg.get("root_folder") or settings.get_as_string(
             f"/{_ext}/default_root_folder"
         ) or "~/blv_data"
-        default_env = settings.get_as_string(
+        default_env = cfg.get("environment") or settings.get_as_string(
             f"/{_ext}/default_environment"
         ) or "hospital_hallway"
+
+        # Asset browser defaults from YAML
+        default_asset_folder = cfg.get("asset_folder", "")
+        default_asset_class = cfg.get("asset_class_name", "")
+        default_target_prim = cfg.get("target_prim_path", "/World/TargetAsset")
+
+        # Annotator settings from YAML (merged over built-in defaults)
+        annotator_cfg = dict(DEFAULT_ANNOTATORS)
+        if "annotators" in cfg and isinstance(cfg["annotators"], dict):
+            annotator_cfg.update(cfg["annotators"])
 
         # ---- Back-end modules ---------------------------------------- #
         self._camera_ctrl = GamepadCameraController(
@@ -102,8 +140,10 @@ class DataCollectorWindow:
         self._data_recorder = DataRecorder(
             camera_path=default_cam,
             resolution=(default_w, default_h),
+            annotators=annotator_cfg,
         )
         self._asset_browser = AssetBrowser()
+        self._annotator_cfg: Dict[str, bool] = annotator_cfg
 
         # Project settings state
         self._root_folder: str = default_root
@@ -111,6 +151,11 @@ class DataCollectorWindow:
         self._resolution_w: int = default_w
         self._resolution_h: int = default_h
         self._rt_subframes: int = default_rt
+
+        # Asset browser defaults from config
+        self._default_asset_folder: str = default_asset_folder
+        self._default_asset_class: str = default_asset_class
+        self._default_target_prim: str = default_target_prim
 
         # Async task handle for "Record with Trajectory"
         self._record_traj_task: Optional[asyncio.Task] = None
@@ -414,6 +459,15 @@ class DataCollectorWindow:
                         "Teardown", clicked_fn=self._on_teardown_writer
                     )
 
+                # Show enabled annotators from config
+                enabled = get_enabled_annotator_names(self._annotator_cfg)
+                ann_text = ", ".join(enabled) if enabled else "(none)"
+                self._widgets["data_annotators"] = ui.Label(
+                    f"Annotators: {ann_text}",
+                    height=_FIELD_HEIGHT,
+                    word_wrap=True,
+                )
+
                 self._widgets["data_status"] = ui.Label(
                     "Status: Not set up | Frames: 0", height=_FIELD_HEIGHT
                 )
@@ -465,18 +519,18 @@ class DataCollectorWindow:
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Asset Folder:", width=_LABEL_WIDTH)
                     self._widgets["ab_folder"] = ui.StringField()
-                    self._widgets["ab_folder"].model.set_value("")
+                    self._widgets["ab_folder"].model.set_value(self._default_asset_folder)
                     ui.Button("...", width=30, clicked_fn=self._on_browse_asset_folder)
 
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Class Name:", width=_LABEL_WIDTH)
                     self._widgets["ab_class"] = ui.StringField()
-                    self._widgets["ab_class"].model.set_value("")
+                    self._widgets["ab_class"].model.set_value(self._default_asset_class)
 
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Target Prim:", width=_LABEL_WIDTH)
                     self._widgets["ab_target"] = ui.StringField()
-                    self._widgets["ab_target"].model.set_value("/World/TargetAsset")
+                    self._widgets["ab_target"].model.set_value(self._default_target_prim)
                     ui.Button("Pick", width=50, clicked_fn=self._on_pick_target_prim)
 
                 with ui.HStack(height=_BUTTON_HEIGHT):
@@ -747,6 +801,7 @@ class DataCollectorWindow:
         recorder = DataRecorder(
             camera_path=self._camera_ctrl.camera_path,
             resolution=resolution,
+            annotators=self._annotator_cfg,
         )
 
         self._widgets["rwt_status"].text = "Setting up writer..."
@@ -823,6 +878,9 @@ class DataCollectorWindow:
         """Scan an asset folder and update the browser."""
         cls = self._widgets["ab_class"].model.get_value_as_string().strip()
         target = self._widgets["ab_target"].model.get_value_as_string().strip()
+
+        # Normalize path to resolve ~, double slashes, trailing slashes, etc.
+        folder = os.path.normpath(os.path.expanduser(folder))
 
         if not folder or not os.path.isdir(folder):
             carb.log_warn(f"[BLV] Invalid asset folder: '{folder}'")

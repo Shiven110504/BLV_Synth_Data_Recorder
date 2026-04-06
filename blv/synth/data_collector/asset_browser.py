@@ -139,6 +139,7 @@ class AssetBrowser:
         int
             Number of USD files found.
         """
+        folder_path = os.path.normpath(os.path.expanduser(folder_path))
         self._asset_folder = folder_path
         if class_name is not None:
             self._class_name = class_name
@@ -158,6 +159,11 @@ class AssetBrowser:
 
     def set_target_prim(self, prim_path: str) -> None:
         """Set the USD prim path where assets are loaded as references."""
+        if prim_path and not prim_path.startswith("/"):
+            prim_path = "/World/" + prim_path
+            carb.log_warn(
+                f"[BLV] Target prim path was not absolute — auto-corrected to '{prim_path}'"
+            )
         self._target_prim_path = prim_path
 
     def next_asset(self) -> bool:
@@ -215,6 +221,14 @@ class AssetBrowser:
         if stage is None:
             carb.log_error("[BLV] No USD stage available.")
             return False
+
+        # Ensure target prim path is a valid absolute USD path
+        if not self._target_prim_path or not self._target_prim_path.startswith("/"):
+            self._target_prim_path = "/World/" + (self._target_prim_path or "TargetAsset")
+            carb.log_warn(
+                f"[BLV] Target prim path was not absolute — auto-corrected to "
+                f"'{self._target_prim_path}'"
+            )
 
         # Ensure the target prim exists (create an Xform if not)
         prim = stage.GetPrimAtPath(self._target_prim_path)

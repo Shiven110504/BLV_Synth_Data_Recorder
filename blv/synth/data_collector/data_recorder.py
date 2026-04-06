@@ -34,19 +34,46 @@ Important
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import carb
 import omni.replicator.core as rep
 
 
-# List of annotator names enabled in this recorder, for UI display purposes.
-ENABLED_ANNOTATORS: List[str] = [
-    "RGB",
-    "Semantic Segmentation",
-    "Colorized Semantic Segmentation",
-    "Bounding Box 2D Tight",
-]
+# Default annotator flags — used when no config overrides are provided.
+DEFAULT_ANNOTATORS: Dict[str, bool] = {
+    "rgb": True,
+    "semantic_segmentation": True,
+    "colorize_semantic_segmentation": True,
+    "bounding_box_2d_tight": True,
+    "bounding_box_2d_loose": False,
+    "bounding_box_3d": False,
+    "instance_segmentation": False,
+    "normals": False,
+    "distance_to_image_plane": False,
+}
+
+# Human-readable names for UI display.
+_ANNOTATOR_DISPLAY_NAMES: Dict[str, str] = {
+    "rgb": "RGB",
+    "semantic_segmentation": "Semantic Segmentation",
+    "colorize_semantic_segmentation": "Colorized Semantic Segmentation",
+    "bounding_box_2d_tight": "Bounding Box 2D Tight",
+    "bounding_box_2d_loose": "Bounding Box 2D Loose",
+    "bounding_box_3d": "Bounding Box 3D",
+    "instance_segmentation": "Instance Segmentation",
+    "normals": "Normals",
+    "distance_to_image_plane": "Distance to Image Plane",
+}
+
+
+def get_enabled_annotator_names(annotators: Dict[str, bool]) -> List[str]:
+    """Return human-readable names of enabled annotators."""
+    return [
+        _ANNOTATOR_DISPLAY_NAMES[k]
+        for k, v in annotators.items()
+        if v and k in _ANNOTATOR_DISPLAY_NAMES
+    ]
 
 
 class DataRecorder:
@@ -67,9 +94,11 @@ class DataRecorder:
         self,
         camera_path: str = "/World/BLV_Camera",
         resolution: Tuple[int, int] = (1280, 720),
+        annotators: Optional[Dict[str, bool]] = None,
     ) -> None:
         self._camera_path: str = camera_path
         self._resolution: Tuple[int, int] = resolution
+        self._annotators: Dict[str, bool] = dict(annotators or DEFAULT_ANNOTATORS)
         self._render_product = None
         self._writer = None
         self._is_setup: bool = False
@@ -133,6 +162,14 @@ class DataRecorder:
     def rt_subframes(self, val: int) -> None:
         self._rt_subframes = max(1, val)
 
+    @property
+    def annotators(self) -> Dict[str, bool]:
+        return self._annotators
+
+    @annotators.setter
+    def annotators(self, val: Dict[str, bool]) -> None:
+        self._annotators = dict(val)
+
     # ------------------------------------------------------------------ #
     #  Public API                                                         #
     # ------------------------------------------------------------------ #
@@ -168,20 +205,18 @@ class DataRecorder:
 
             # --- BasicWriter ---
             self._writer = rep.writers.get("BasicWriter")
+            ann = self._annotators
             self._writer.initialize(
                 output_dir=output_dir,
-                # Enabled annotators
-                rgb=True,
-                bounding_box_2d_tight=True,
-                semantic_segmentation=True,
-                colorize_semantic_segmentation=True,
-                # Disabled annotators — explicit for clarity
-                instance_segmentation=False,
-                bounding_box_2d_loose=False,
-                bounding_box_3d=False,
-                normals=False,
-                distance_to_image_plane=False,
-                # File naming
+                rgb=ann.get("rgb", True),
+                semantic_segmentation=ann.get("semantic_segmentation", True),
+                colorize_semantic_segmentation=ann.get("colorize_semantic_segmentation", True),
+                bounding_box_2d_tight=ann.get("bounding_box_2d_tight", True),
+                bounding_box_2d_loose=ann.get("bounding_box_2d_loose", False),
+                bounding_box_3d=ann.get("bounding_box_3d", False),
+                instance_segmentation=ann.get("instance_segmentation", False),
+                normals=ann.get("normals", False),
+                distance_to_image_plane=ann.get("distance_to_image_plane", False),
                 frame_padding=self.FRAME_PADDING,
             )
             self._writer.attach([self._render_product])

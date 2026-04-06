@@ -1,0 +1,37 @@
+# BLV Synth Data Collector — User Configuration
+# ================================================
+# Edit this file to set persistent defaults that carry across IsaacSim runs.
+# Values here override the extension.toml defaults but can still be changed
+# at runtime through the UI.
+
+# --- Project ---
+root_folder: "~/blv_data"
+environment: "hospital_hallway"
+
+# --- Camera ---
+camera_path: "/World/BLV_Camera"
+move_speed: 60.0
+look_speed: 30.0
+
+# --- Rendering ---
+resolution_width: 1280
+resolution_height: 720
+rt_subframes: 4
+
+# --- Asset Browser ---
+asset_folder: ""
+asset_class_name: ""
+target_prim_path: "/World/TargetAsset"
+
+# --- Data Capture (annotators) ---
+# Toggle which annotators the BasicWriter enables.
+annotators:
+  rgb: true
+  semantic_segmentation: true
+  colorize_semantic_segmentation: true
+  bounding_box_2d_tight: true
+  bounding_box_2d_loose: false
+  bounding_box_3d: false
+  instance_segmentation: false
+  normals: false
+  distance_to_image_plane: false
