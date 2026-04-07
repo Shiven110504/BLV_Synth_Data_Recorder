@@ -1,23 +1,27 @@
 """
-AssetBrowser — USD asset folder browser with semantic labeling.
-===============================================================
+AssetBrowser — swap USD assets on a target prim from a local folder.
+====================================================================
 
-Scans a local directory for USD files (``*.usd``, ``*.usda``, ``*.usdc``,
-``*.usdz``), presents them as a navigable list, and loads each one as a **USD
-reference** on a configurable target prim.
+Scans a directory for USD files and lets the user step through them with
+next/prev.  Each swap:
 
-Semantic labeling
------------------
-Every time an asset is loaded the browser:
+  1. Reads the target prim's world-space translation (so the next asset
+     appears in the same spot).
+  2. Clears the viewport selection (avoids Kit manipulator crash on
+     stale child paths).
+  3. Deletes the old target prim entirely via ``DeletePrims`` command.
+  4. Re-creates it with a reference via ``CreateReference`` command.
+  5. Lets MetricsAssembler handle any metersPerUnit / upAxis mismatch
+     (the SAM3d assets are in meters + Z-up, Isaac Sim is cm + Y-up).
+  6. Overwrites ONLY the translate op so the asset lands at the saved
+     position — scale and rotation corrections from MetricsAssembler
+     are preserved.
+  7. Applies the semantic class label.
 
-1. **Removes** the configured class label from any prims that previously had it
-   (tracked via an internal cache — no expensive full-stage traversal on every
-   swap).
-2. **Adds** the class label to the target prim so that Replicator annotators
-   (semantic segmentation, bounding boxes) pick it up correctly.
-
-This uses Isaac Sim's ``isaacsim.core.utils.semantics.add_labels`` /
-``remove_labels`` helpers which write the ``Semantics`` schema to USD prims.
+Key insight: MetricsAssembler inserts ``xformOp:scale:unitsResolve``
+and ``xformOp:rotateX:unitsResolve`` to fix the 100x scale and Z→Y
+axis flip.  If we call ``ClearXformOpOrder()`` we destroy those fixes.
+So we ONLY touch ``xformOp:translate`` and leave everything else alone.
 """
 
 from __future__ import annotations
@@ -27,25 +31,14 @@ import os
 from typing import List, Optional, Set
 
 import carb
+import omni.kit.commands
 import omni.usd
-from pxr import Gf, Usd, UsdGeom
+from pxr import Gf, Sdf, Usd, UsdGeom
 
 
 class AssetBrowser:
-    """Browse and swap USD assets from a local folder.
+    """Browse and swap USD assets from a local folder."""
 
-    Parameters
-    ----------
-    asset_folder : str
-        Initial directory to scan (can be changed later via :meth:`set_folder`).
-    class_name : str
-        Semantic class label applied to each loaded asset (e.g.
-        ``"elevator_button"``).
-    target_prim_path : str
-        USD prim path where asset references will be loaded.
-    """
-
-    # File extensions recognised as USD assets (searched recursively)
     USD_EXTENSIONS: tuple = ("*.usd", "*.usda", "*.usdc", "*.usdz")
 
     def __init__(
@@ -60,42 +53,37 @@ class AssetBrowser:
 
         self._assets: List[str] = []
         self._current_index: int = -1
-
-        # Cache of prim paths that currently carry our class label so we can
-        # remove it without traversing the entire stage every time.
         self._labeled_prim_paths: Set[str] = set()
 
-    # ------------------------------------------------------------------ #
-    #  Properties                                                         #
-    # ------------------------------------------------------------------ #
+        # Saved position — set by the user once, reused on every swap.
+        # We only save translate because scale/rotation are handled by
+        # MetricsAssembler for unit correction.
+        self._saved_translate: Optional[Gf.Vec3d] = None
+
+    # ── properties ─────────────────────────────────────────────────────
 
     @property
     def current_index(self) -> int:
-        """Zero-based index of the currently loaded asset (``-1`` if none)."""
         return self._current_index
 
     @property
     def total_assets(self) -> int:
-        """Number of USD files found in the active folder."""
         return len(self._assets)
 
     @property
     def current_asset_name(self) -> str:
-        """Basename of the currently loaded asset, or ``"None"``."""
         if 0 <= self._current_index < len(self._assets):
             return os.path.basename(self._assets[self._current_index])
         return "None"
 
     @property
     def current_asset_path(self) -> str:
-        """Full path of the currently loaded asset, or empty string."""
         if 0 <= self._current_index < len(self._assets):
             return self._assets[self._current_index]
         return ""
 
     @property
     def current_asset_stem(self) -> str:
-        """Filename without extension of the currently loaded asset."""
         if 0 <= self._current_index < len(self._assets):
             return os.path.splitext(os.path.basename(self._assets[self._current_index]))[0]
         return ""
@@ -120,369 +108,230 @@ class AssetBrowser:
     def asset_folder(self) -> str:
         return self._asset_folder
 
-    # ------------------------------------------------------------------ #
-    #  Public API                                                         #
-    # ------------------------------------------------------------------ #
+    # ── public API ─────────────────────────────────────────────────────
 
     def set_folder(self, folder_path: str, class_name: Optional[str] = None) -> int:
-        """Scan *folder_path* for USD files and optionally update the class name.
-
-        Parameters
-        ----------
-        folder_path : str
-            Directory containing USD asset files.
-        class_name : str, optional
-            If provided, updates the semantic class label.
-
-        Returns
-        -------
-        int
-            Number of USD files found.
-        """
+        """Scan folder_path for USD files.  Returns the count found."""
         folder_path = os.path.normpath(os.path.expanduser(folder_path))
         self._asset_folder = folder_path
         if class_name is not None:
             self._class_name = class_name
 
-        carb.log_info(f"[BLV] AssetBrowser scanning '{folder_path}' (isdir={os.path.isdir(folder_path)})")
-
-        # Collect and sort all matching files — flat scan, no recursion.
-        # Assets are expected directly inside *folder_path* (not nested).
         self._assets = sorted(
-            path
-            for ext in self.USD_EXTENSIONS
-            for path in _glob.glob(os.path.join(folder_path, ext))
+            p for ext in self.USD_EXTENSIONS
+            for p in _glob.glob(os.path.join(folder_path, ext))
         )
         self._current_index = -1
+        self._saved_translate = None   # reset on new folder
 
         carb.log_info(
-            f"[BLV] AssetBrowser scanned '{folder_path}' — "
-            f"{len(self._assets)} USD files found."
+            f"[BLV] AssetBrowser: {len(self._assets)} USD files in '{folder_path}'"
         )
         return len(self._assets)
 
     def set_target_prim(self, prim_path: str) -> None:
-        """Set the USD prim path where assets are loaded as references."""
         if prim_path and not prim_path.startswith("/"):
             prim_path = "/World/" + prim_path
-            carb.log_warn(
-                f"[BLV] Target prim path was not absolute — auto-corrected to '{prim_path}'"
-            )
         self._target_prim_path = prim_path
 
     def next_asset(self) -> bool:
-        """Load the next asset in the sorted list (wraps around).
-
-        Returns
-        -------
-        bool
-            ``True`` on success.
-        """
         if not self._assets:
-            carb.log_warn("[BLV] No assets available — set a folder first.")
+            carb.log_warn("[BLV] No assets — scan a folder first.")
             return False
-        next_idx = (self._current_index + 1) % len(self._assets)
-        return self.load_asset(next_idx)
+        return self.load_asset((self._current_index + 1) % len(self._assets))
 
     def previous_asset(self) -> bool:
-        """Load the previous asset in the sorted list (wraps around).
-
-        Returns
-        -------
-        bool
-            ``True`` on success.
-        """
         if not self._assets:
-            carb.log_warn("[BLV] No assets available — set a folder first.")
+            carb.log_warn("[BLV] No assets — scan a folder first.")
             return False
-        prev_idx = (self._current_index - 1) % len(self._assets)
-        return self.load_asset(prev_idx)
+        return self.load_asset((self._current_index - 1) % len(self._assets))
 
     def load_asset(self, index: int) -> bool:
-        """Load a specific asset by its index in the sorted file list.
+        """Load asset at index onto the target prim.
 
-        The asset is applied as a USD **reference** on the target prim.  Any
-        previous reference on that prim is cleared first.  After loading, the
-        semantic class label is applied (and removed from any prims that had it
-        before).
-
-        Parameters
-        ----------
-        index : int
-            Zero-based index into the sorted asset list.
-
-        Returns
-        -------
-        bool
-            ``True`` if the asset was loaded successfully.
+        Strategy:
+          1. Save current translate (if prim exists and user has positioned it).
+          2. Clear viewport selection (avoids Kit manipulator crash).
+          3. Delete the old target prim via Kit command.
+          4. Create new prim + reference via Kit command.
+          5. MetricsAssembler auto-fixes scale/rotation for unit mismatch.
+          6. Overwrite ONLY the translate to restore user's position.
+          7. Apply semantic label.
         """
         if index < 0 or index >= len(self._assets):
-            carb.log_error(f"[BLV] Asset index {index} out of range [0, {len(self._assets)}).")
+            carb.log_error(f"[BLV] Index {index} out of range.")
             return False
 
         asset_path = self._assets[index]
-        stage: Usd.Stage = omni.usd.get_context().get_stage()
-        if stage is None:
-            carb.log_error("[BLV] No USD stage available.")
+        if not os.path.isfile(asset_path):
+            carb.log_error(f"[BLV] File not found: {asset_path}")
             return False
 
-        # Ensure target prim path is a valid absolute USD path
-        if not self._target_prim_path or not self._target_prim_path.startswith("/"):
-            self._target_prim_path = "/World/" + (self._target_prim_path or "TargetAsset")
-            carb.log_warn(
-                f"[BLV] Target prim path was not absolute — auto-corrected to "
-                f"'{self._target_prim_path}'"
-            )
+        stage = omni.usd.get_context().get_stage()
+        if stage is None:
+            carb.log_error("[BLV] No USD stage.")
+            return False
 
-        # If the target prim already exists, snapshot its transform so we
-        # can re-apply it after the swap — this lets every asset appear at
-        # the position the user placed the target prim in.
-        existing = stage.GetPrimAtPath(self._target_prim_path)
+        target = self._target_prim_path
+
+        # ── 1. Save translate from current prim ────────────────────────
+        existing = stage.GetPrimAtPath(target)
         if existing.IsValid():
-            saved_translate, saved_rot_xyz, saved_scale = self._read_xform(existing)
-        else:
-            saved_translate = Gf.Vec3d(0.0, 0.0, 0.0)
-            saved_rot_xyz = Gf.Vec3f(0.0, 0.0, 0.0)
-            saved_scale = Gf.Vec3f(1.0, 1.0, 1.0)
+            self._saved_translate = self._read_translate(existing)
 
-        # Clear the viewport selection *before* mutating the prim.
-        # If the user had a child of the referenced asset selected (e.g.
-        # ``/World/TargetAsset/ElavatorRequestButtons01_Low_A``), removing
-        # the target prim destroys that child, and Kit's manipulator fires
-        # ``on_selection_changed`` with a now-invalid SdfPath — the
-        # source of the ``Ill-formed SdfPath <>`` / ``KeyError: NoneType``
-        # errors that cascade out of the viewport update loop.
+        # ── 2. Clear viewport selection ────────────────────────────────
+        # The old prim's children will be destroyed. If any are selected,
+        # Kit's manipulator selector crashes with Ill-formed SdfPath.
         try:
             omni.usd.get_context().get_selection().set_selected_prim_paths([], False)
-        except Exception as exc:
-            carb.log_warn(f"[BLV] Could not clear viewport selection: {exc}")
+        except Exception:
+            pass
 
-        # Strategy: obliterate the target prim and redefine it clean,
-        # *then* add the new reference.  This gives us three guarantees:
-        #
-        # 1. No leftover child prims from the previous reference, so
-        #    ``MetricsAssemblerManager`` — which aborts ``AddReference``
-        #    when "path already contains children prims" with mismatched
-        #    units — always sees a fresh prim and approves the add.
-        # 2. No stale xformOp attributes with the previous asset's
-        #    precision, so our ``_write_xform`` won't hit the
-        #    ``PrecisionFloat != double3`` error.
-        # 3. Hydra receives a prim-removed + prim-added notification
-        #    rather than a subtle reference-list mutation on an existing
-        #    prim, which the render delegate handles cleanly and
-        #    actually redraws the viewport.
+        # ── 3. Delete old prim ─────────────────────────────────────────
+        if existing.IsValid():
+            try:
+                omni.kit.commands.execute("DeletePrims",
+                    paths=[target], destructive=True)
+            except Exception:
+                # Fallback: raw USD
+                try:
+                    stage.RemovePrim(target)
+                except Exception as exc:
+                    carb.log_error(f"[BLV] Cannot remove {target}: {exc}")
+
+        # ── 4. Create new prim with reference ──────────────────────────
+        abs_path = os.path.abspath(asset_path)
+
         try:
-            if existing.IsValid():
-                stage.RemovePrim(self._target_prim_path)
-            prim = stage.DefinePrim(self._target_prim_path, "Xform")
-            prim.GetReferences().AddReference(asset_path)
-        except Exception as exc:
-            carb.log_error(
-                f"[BLV] Failed to swap reference on {self._target_prim_path}: {exc}"
+            omni.kit.commands.execute("CreateReference",
+                usd_context=omni.usd.get_context(),
+                path_to=Sdf.Path(target),
+                asset_path=abs_path,
+                prim_path=None,         # use file's defaultPrim
+                instanceable=False,     # we need to write xformOps
+                select_prim=False,      # avoid manipulator crash
             )
-            return False
+        except Exception as exc:
+            carb.log_warn(f"[BLV] CreateReference command failed: {exc}")
+            # Fallback: raw USD API
+            try:
+                prim = stage.DefinePrim(target, "Xform")
+                prim.GetReferences().AddReference(abs_path)
+            except Exception as exc2:
+                carb.log_error(f"[BLV] Fallback also failed: {exc2}")
+                return False
 
-        # Re-apply the saved xform onto the freshly-defined prim so it
-        # overrides the asset's internal transforms and sits where the
-        # user placed the target prim.
-        self._write_xform(prim, saved_translate, saved_rot_xyz, saved_scale)
+        # ── 5. Let MetricsAssembler run ────────────────────────────────
+        # MetricsAssembler fires automatically on the next frame and
+        # inserts unitsResolve xformOps.  We don't need to do anything.
+        # Our translate write below is additive — it doesn't destroy
+        # the unitsResolve ops.
+
+        # ── 6. Restore translate only ──────────────────────────────────
+        prim = stage.GetPrimAtPath(target)
+        if prim.IsValid() and self._saved_translate is not None:
+            self._write_translate(prim, self._saved_translate)
+
+        # ── 7. Semantic label ──────────────────────────────────────────
+        if prim.IsValid():
+            self._apply_semantic_label(stage, prim)
 
         self._current_index = index
-
-        # Update semantic labels
-        self._apply_semantic_label(stage, prim)
-
-        # Use log_warn (visible by default in Kit's console) so the user
-        # can confirm swaps are happening.
         carb.log_warn(
             f"[BLV] Loaded asset [{index + 1}/{len(self._assets)}] "
-            f"'{os.path.basename(asset_path)}' → {self._target_prim_path}"
+            f"'{os.path.basename(asset_path)}' → {target}"
         )
         return True
 
-    # ------------------------------------------------------------------ #
-    #  Internal — Transform helpers                                        #
-    # ------------------------------------------------------------------ #
+    # ── transform helpers ──────────────────────────────────────────────
 
     @staticmethod
-    def _read_xform(prim: Usd.Prim):
-        """Read translate / rotateXYZ / scale from *prim* if present.
+    def _read_translate(prim: Usd.Prim) -> Gf.Vec3d:
+        """Read the world-space translation from a prim.
 
-        Returns a tuple of ``(Vec3d translate, Vec3f rotateXYZ, Vec3f scale)``,
-        using identity defaults when an op is missing.
-        """
-        translate = Gf.Vec3d(0.0, 0.0, 0.0)
-        rotate = Gf.Vec3f(0.0, 0.0, 0.0)
-        scale = Gf.Vec3f(1.0, 1.0, 1.0)
-
-        xformable = UsdGeom.Xformable(prim)
-        if not xformable:
-            return translate, rotate, scale
-
-        for op in xformable.GetOrderedXformOps():
-            name = op.GetOpName()
-            val = op.Get()
-            if val is None:
-                continue
-            if name == "xformOp:translate":
-                translate = Gf.Vec3d(val)
-            elif name == "xformOp:rotateXYZ":
-                rotate = Gf.Vec3f(val)
-            elif name == "xformOp:scale":
-                scale = Gf.Vec3f(val)
-        return translate, rotate, scale
-
-    @staticmethod
-    def _write_xform(
-        prim: Usd.Prim,
-        translate: "Gf.Vec3d",
-        rotate_xyz: "Gf.Vec3f",
-        scale: "Gf.Vec3f",
-    ) -> None:
-        """Force-apply explicit translate/rotate/scale xformOps on *prim*.
-
-        Works for prims whose op stack is *not* ``XformCommonAPI``-compatible
-        — e.g. a referenced USDZ that defines ``xformOp:transform`` (matrix)
-        or ``xformOp:orient`` (quaternion), which would make
-        ``UsdGeom.XformCommonAPI`` refuse with "incompatible xformable".
-
-        Strategy:
-          1. ``ClearXformOpOrder`` on the local layer.  This removes ops
-             from the order list but leaves the underlying attributes
-             intact, so subsequent ``AddXformOp`` calls can reuse them.
-          2. For each op we want (translate, rotateXYZ, scale), detect
-             the precision of the existing underlying attribute (if any)
-             so that ``AddXformOp`` does not raise
-             ``PrecisionFloat != double3``.
-          3. Create/reuse the op and set its value at the matching
-             precision.
-          4. Call ``SetXformOpOrder`` so the layer order lists exactly
-             ``[translate, rotate, scale]`` — any other ops the
-             reference brought in remain defined but are no longer
-             applied, and the prim's local transform is determined
-             purely by ours.
-
-        Any failure is logged but swallowed — transform preservation is
-        best-effort and must not block downstream steps like semantic
-        labeling.
+        Uses ComputeLocalToWorldTransform to get the actual position
+        regardless of what xformOps exist (including unitsResolve ops
+        from MetricsAssembler).
         """
         try:
-            xformable = UsdGeom.Xformable(prim)
-            if not xformable:
+            xf = UsdGeom.Xformable(prim)
+            mat = xf.ComputeLocalToWorldTransform(Usd.TimeCode.Default())
+            return Gf.Vec3d(mat.ExtractTranslation())
+        except Exception:
+            return Gf.Vec3d(0, 0, 0)
+
+    @staticmethod
+    def _write_translate(prim: Usd.Prim, translate: Gf.Vec3d) -> None:
+        """Write ONLY the translate xformOp, preserving all other ops.
+
+        This is the key to not breaking MetricsAssembler's corrections.
+        MetricsAssembler adds ops like:
+          - xformOp:scale:unitsResolve = (100, 100, 100)
+          - xformOp:rotateX:unitsResolve = -90.0
+        and sets xformOpOrder accordingly.
+
+        We check if xformOp:translate already exists (it may have been
+        created by DefinePrim("Xform") or by the referenced asset).
+        If yes, just set its value.  If not, add it and prepend it to
+        the existing op order.
+        """
+        try:
+            xf = UsdGeom.Xformable(prim)
+            if not xf:
                 return
 
-            def precision_of(attr_name: str, default):
-                """Return the XformOp precision that matches the existing
-                attribute's typeName, or *default* if the attribute does
-                not exist yet.
-                """
-                if not prim.HasAttribute(attr_name):
-                    return default
-                type_name = str(prim.GetAttribute(attr_name).GetTypeName())
+            # Check if translate op already exists
+            translate_attr = prim.GetAttribute("xformOp:translate")
+            if translate_attr and translate_attr.IsValid():
+                # Detect precision
+                type_name = str(translate_attr.GetTypeName())
                 if "double" in type_name:
-                    return UsdGeom.XformOp.PrecisionDouble
-                if "half" in type_name:
-                    return UsdGeom.XformOp.PrecisionHalf
-                return UsdGeom.XformOp.PrecisionFloat
+                    translate_attr.Set(Gf.Vec3d(translate))
+                else:
+                    translate_attr.Set(Gf.Vec3f(translate[0], translate[1], translate[2]))
+            else:
+                # No translate op yet — add one and prepend to order
+                t_op = xf.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+                t_op.Set(Gf.Vec3d(translate))
 
-            def cast(value, precision):
-                if precision == UsdGeom.XformOp.PrecisionDouble:
-                    return Gf.Vec3d(value)
-                # Half and Float both accept a Vec3f from python bindings
-                return Gf.Vec3f(value)
+                # Prepend our translate to whatever ops exist
+                # (e.g., MetricsAssembler's unitsResolve ops)
+                existing_ops = xf.GetOrderedXformOps()
+                new_order = [t_op]
+                for op in existing_ops:
+                    if op.GetOpName() != "xformOp:translate":
+                        new_order.append(op)
+                xf.SetXformOpOrder(new_order)
 
-            # USD's ``AddXformOp`` raises if the op name is already
-            # present in ``xformOpOrder`` — which happens on every call
-            # after the first.  Clearing the order here is safe: the
-            # underlying attributes (xformOp:translate, etc.) are NOT
-            # deleted, only removed from the local-layer order list.
-            # ``AddXformOp`` then reuses those existing attributes as
-            # long as precision matches — which we guarantee via
-            # ``precision_of`` below.
-            xformable.ClearXformOpOrder()
-
-            # -- Translate --------------------------------------------
-            t_prec = precision_of(
-                "xformOp:translate", UsdGeom.XformOp.PrecisionDouble
-            )
-            t_op = xformable.AddTranslateOp(t_prec)
-            t_op.Set(cast(translate, t_prec))
-
-            # -- Rotate (XYZ) -----------------------------------------
-            r_prec = precision_of(
-                "xformOp:rotateXYZ", UsdGeom.XformOp.PrecisionFloat
-            )
-            r_op = xformable.AddRotateXYZOp(r_prec)
-            r_op.Set(cast(rotate_xyz, r_prec))
-
-            # -- Scale -------------------------------------------------
-            s_prec = precision_of(
-                "xformOp:scale", UsdGeom.XformOp.PrecisionFloat
-            )
-            s_op = xformable.AddScaleOp(s_prec)
-            s_op.Set(cast(scale, s_prec))
-
-            # Re-establish the explicit order after the clear.  Any
-            # other ops the reference brought in (xformOp:transform
-            # matrix, xformOp:orient quat, ...) remain defined as
-            # attributes but are no longer applied because they're not
-            # in the order list.
-            xformable.SetXformOpOrder([t_op, r_op, s_op])
         except Exception as exc:
-            carb.log_warn(
-                f"[BLV] Could not preserve target prim transform "
-                f"on {prim.GetPath()}: {exc}"
-            )
+            carb.log_warn(f"[BLV] Translate write failed on {prim.GetPath()}: {exc}")
 
-    # ------------------------------------------------------------------ #
-    #  Internal — Semantic labeling                                       #
-    # ------------------------------------------------------------------ #
+    # ── semantic labeling ──────────────────────────────────────────────
 
     def _apply_semantic_label(self, stage: Usd.Stage, target_prim: Usd.Prim) -> None:
-        """Apply the class label to *target_prim* and remove it from any prim
-        that previously had it.
-
-        We maintain ``_labeled_prim_paths`` as a cache so that we only touch
-        prims we know about, rather than traversing the entire stage every
-        time an asset is swapped.
-        """
-        # Lazy import — Isaac Sim semantics helpers
+        """Apply class label to target_prim, remove from previously labeled prims."""
         try:
             from isaacsim.core.utils.semantics import add_labels, remove_labels
         except ImportError:
-            carb.log_error(
-                "[BLV] Could not import isaacsim.core.utils.semantics — "
-                "semantic labeling unavailable."
-            )
+            carb.log_error("[BLV] Cannot import isaacsim.core.utils.semantics.")
             return
 
-        # 1) Remove the class label from previously labeled prims
-        stale_paths = set(self._labeled_prim_paths)  # copy
-        for path in stale_paths:
+        # Remove from old prims
+        for path in set(self._labeled_prim_paths):
             if path == str(target_prim.GetPath()):
-                # Will be re-applied below; skip removal for efficiency
                 continue
-            old_prim = stage.GetPrimAtPath(path)
-            if old_prim.IsValid():
+            old = stage.GetPrimAtPath(path)
+            if old.IsValid():
                 try:
-                    remove_labels(old_prim, instance_name="class")
-                except Exception as exc:
-                    carb.log_warn(
-                        f"[BLV] Failed to remove label from {path}: {exc}"
-                    )
+                    remove_labels(old, instance_name="class")
+                except Exception:
+                    pass
         self._labeled_prim_paths.clear()
 
-        # 2) Add the class label to the target prim
+        # Add to target
         if self._class_name:
             try:
                 add_labels(target_prim, labels=[self._class_name], instance_name="class")
                 self._labeled_prim_paths.add(str(target_prim.GetPath()))
-                carb.log_info(
-                    f"[BLV] Semantic label '{self._class_name}' applied to "
-                    f"{target_prim.GetPath()}"
-                )
             except Exception as exc:
-                carb.log_error(
-                    f"[BLV] Failed to add semantic label to "
-                    f"{target_prim.GetPath()}: {exc}"
-                )
+                carb.log_error(f"[BLV] Semantic label failed: {exc}")
