@@ -230,47 +230,43 @@ class DataCollectorWindow:
     def _apply_project_paths(self) -> None:
         """Derive all paths from root folder + environment and push to modules.
 
-        Trajectory dir follows the same class/env structure::
+        Trajectory dir follows the class-scoped structure::
 
             {root}/{class}/{environment}/trajectories/
 
-        Falls back to ``{root}/{environment}/trajectories/`` when no class is set.
+        When no class has been set yet, the trajectory manager's directory
+        is left cleared; the user will be prompted to set a class before
+        any recording is allowed.
         """
         root = os.path.expanduser(self._root_folder)
         env = self._environment
+        cls = self._current_class_name()
 
-        # Use class from asset browser if available
-        cls = ""
-        if "ab_class" in self._widgets:
-            cls = self._widgets["ab_class"].model.get_value_as_string().strip()
-
-        # Trajectory manager
-        self._traj_manager.set_project_paths(root, env, class_name=cls)
+        if cls:
+            self._traj_manager.set_project_paths(root, env, class_name=cls)
+        else:
+            self._traj_manager.directory = ""
 
         # Refresh trajectory list in UI
         self._refresh_trajectory_lists()
 
-    def _get_class_env_dir(self, class_name: str = "") -> str:
+    def _get_class_env_dir(self, class_name: str) -> str:
         """Base directory for the current class + environment.
 
-        ``{root}/[{class}/]{env}``
+        ``{root}/{class}/{env}`` — class is **required**.
         """
         root = os.path.expanduser(self._root_folder)
-        env = self._environment
-        parts = [root]
-        if class_name:
-            parts.append(class_name)
-        if env:
-            parts.append(env)
-        return os.path.join(*parts)
+        return os.path.join(root, class_name, self._environment)
 
-    def _current_run_dir(self, class_name: str = "") -> str:
+    def _current_run_dir(self, class_name: str) -> str:
         """Return (and lazily allocate) the ``run_N`` folder for this session.
 
         The run number is determined once per window lifetime by scanning
         the current class+env directory for existing ``run_*`` folders and
         picking the next available integer.  All recordings made in the
-        same window session share this run folder.
+        same window session share this run folder.  If the caller asks
+        for a different class from the one the cached run belongs to,
+        a fresh run is allocated.
         """
         base = self._get_class_env_dir(class_name)
         if self._run_dir and os.path.dirname(self._run_dir) == base:
@@ -295,16 +291,16 @@ class DataCollectorWindow:
 
     def _get_capture_output_dir(
         self,
-        class_name: str = "",
+        class_name: str,
         traj_name: str = "",
     ) -> str:
         """Build the capture output directory for the current run.
 
         Structure::
 
-            {root}/[{class}/]{env}/run_N/[{trajectory}/]
+            {root}/{class}/{env}/run_N/[{trajectory}/]
 
-        Class is optional.  Trajectory subfolder is only added when
+        Class is required.  Trajectory subfolder is only added when
         *traj_name* is provided (i.e. for Record-with-Trajectory); the
         manual "Setup Writer" button writes directly into ``run_N``.
         """
@@ -595,6 +591,12 @@ class DataCollectorWindow:
                     self._widgets["ab_class"] = ui.StringField()
                     self._widgets["ab_class"].model.set_value(self._default_asset_class)
                     ui.Label("(= subfolder)", width=100)
+                    # When the class changes, re-derive the trajectory
+                    # directory so new recordings land under the right
+                    # class-scoped folder.
+                    self._widgets["ab_class"].model.add_end_edit_fn(
+                        lambda m: self._apply_project_paths()
+                    )
 
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Target Prim:", width=_LABEL_WIDTH)
@@ -681,6 +683,17 @@ class DataCollectorWindow:
     # ================================================================= #
 
     def _on_start_recording(self) -> None:
+        class_name = self._current_class_name()
+        if not class_name:
+            msg = "Class Name is required — set it in the Asset Browser."
+            self._widgets["traj_rec_status"].text = f"Error: {msg}"
+            carb.log_warn(f"[BLV] {msg}")
+            return
+
+        # Make sure the trajectory manager writes into the class-scoped dir
+        # even if the class was changed after window init.
+        self._apply_project_paths()
+
         name = self._widgets["traj_name"].model.get_value_as_string().strip() or "trajectory"
         if not self._camera_ctrl.is_enabled:
             carb.log_warn("[BLV] Enable the gamepad camera before recording.")
@@ -759,13 +772,21 @@ class DataCollectorWindow:
     # ================================================================= #
 
     def _on_setup_writer(self) -> None:
-        """Manual "Setup Writer" button — independent of the asset browser.
+        """Manual "Setup Writer" button.
 
-        Writes into the current run folder; the class (if set) scopes the
-        path.  It is fine to use this without any asset loaded — e.g. to
-        capture the scene's default asset.
+        Does NOT require an asset to be loaded in the Asset Browser — this
+        is intentional so the user can capture the scene's default asset.
+        It DOES require the Class Name field to be set, because the output
+        path is ``{root}/{class}/{env}/run_N/`` and we refuse to scatter
+        data into the environment folder when no class is specified.
         """
-        class_name = self._asset_browser.class_name
+        class_name = self._current_class_name()
+        if not class_name:
+            msg = "Class Name is required — set it in the Asset Browser."
+            self._widgets["data_status"].text = f"Error: {msg}"
+            carb.log_warn(f"[BLV] {msg}")
+            return
+
         output_dir = self._get_capture_output_dir(class_name=class_name)
 
         w = self._widgets["res_w"].model.get_value_as_int()
@@ -815,9 +836,15 @@ class DataCollectorWindow:
             self._widgets["rwt_status"].text = "Error: trajectory file not found"
             return
 
-        # Build output dir from project settings + asset info.  Class name
-        # is optional — when empty, data lands at the env level.
-        class_name = self._asset_browser.class_name
+        # Class is required — scopes the output path under
+        # {root}/{class}/{env}/run_N/{trajectory}/
+        class_name = self._current_class_name()
+        if not class_name:
+            msg = "Class Name is required — set it in the Asset Browser."
+            self._widgets["rwt_status"].text = f"Error: {msg}"
+            carb.log_warn(f"[BLV] {msg}")
+            return
+
         traj_stem = os.path.splitext(traj_name)[0]
         output_dir = self._get_capture_output_dir(
             class_name=class_name,
@@ -998,15 +1025,22 @@ class DataCollectorWindow:
         self._widgets["ab_status"].text = f"Found {count} USD files"
         self._widgets["ab_current"].text = "Current: None"
 
+    def _current_class_name(self) -> str:
+        """Return the Asset Browser's Class Name field, stripped."""
+        if "ab_class" not in self._widgets:
+            return ""
+        return self._widgets["ab_class"].model.get_value_as_string().strip()
+
     def _expected_scan_folder(self) -> str:
         """Compose the expected scan folder from the UI root + class fields."""
         root = self._widgets["ab_folder"].model.get_value_as_string().strip()
-        cls = self._widgets["ab_class"].model.get_value_as_string().strip()
+        cls = self._current_class_name()
         if not root or not cls:
             return ""
         return os.path.normpath(os.path.join(os.path.expanduser(root), cls))
 
     def _on_next_asset(self) -> None:
+        carb.log_warn("[BLV] Next button clicked")
         # Auto-scan if root or class changed since the last scan
         root = self._widgets["ab_folder"].model.get_value_as_string().strip()
         if self._expected_scan_folder() != self._asset_browser.asset_folder:
@@ -1017,6 +1051,7 @@ class DataCollectorWindow:
         self._update_asset_browser_labels(success)
 
     def _on_prev_asset(self) -> None:
+        carb.log_warn("[BLV] Prev button clicked")
         root = self._widgets["ab_folder"].model.get_value_as_string().strip()
         if self._expected_scan_folder() != self._asset_browser.asset_folder:
             self._scan_asset_folder(root)
