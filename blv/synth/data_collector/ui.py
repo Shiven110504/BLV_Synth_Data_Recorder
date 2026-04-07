@@ -171,6 +171,9 @@ class DataCollectorWindow:
         # Async task handle for "Record with Trajectory"
         self._record_traj_task: Optional[asyncio.Task] = None
 
+        # Lazily-allocated run_N folder for this session (per-window lifetime)
+        self._run_dir: str = ""
+
         # Per-frame UI status updater
         self._status_update_sub = None
 
@@ -247,22 +250,10 @@ class DataCollectorWindow:
         # Refresh trajectory list in UI
         self._refresh_trajectory_lists()
 
-    def _get_capture_output_dir(
-        self,
-        class_name: str = "",
-        asset_name: str = "",
-        traj_name: str = "",
-    ) -> str:
-        """Build the capture output directory from project settings.
+    def _get_class_env_dir(self, class_name: str = "") -> str:
+        """Base directory for the current class + environment.
 
-        Structure::
-
-            {root}/{class}/{environment}/{asset}/{trajectory}/
-
-        Example::
-
-            ~/SDG/Synth_Data/elevator_button/hospital_hallway/
-                ElavatorRequestButtons01_Low_A/trajectory_001/
+        ``{root}/[{class}/]{env}``
         """
         root = os.path.expanduser(self._root_folder)
         env = self._environment
@@ -271,11 +262,56 @@ class DataCollectorWindow:
             parts.append(class_name)
         if env:
             parts.append(env)
-        if asset_name:
-            parts.append(asset_name)
-        if traj_name:
-            parts.append(traj_name)
         return os.path.join(*parts)
+
+    def _current_run_dir(self, class_name: str = "") -> str:
+        """Return (and lazily allocate) the ``run_N`` folder for this session.
+
+        The run number is determined once per window lifetime by scanning
+        the current class+env directory for existing ``run_*`` folders and
+        picking the next available integer.  All recordings made in the
+        same window session share this run folder.
+        """
+        base = self._get_class_env_dir(class_name)
+        if self._run_dir and os.path.dirname(self._run_dir) == base:
+            return self._run_dir
+
+        # Allocate a fresh run number
+        next_n = 1
+        if os.path.isdir(base):
+            existing = []
+            for name in os.listdir(base):
+                if name.startswith("run_"):
+                    try:
+                        existing.append(int(name[4:]))
+                    except ValueError:
+                        pass
+            if existing:
+                next_n = max(existing) + 1
+
+        self._run_dir = os.path.join(base, f"run_{next_n}")
+        carb.log_info(f"[BLV] New run directory → {self._run_dir}")
+        return self._run_dir
+
+    def _get_capture_output_dir(
+        self,
+        class_name: str = "",
+        traj_name: str = "",
+    ) -> str:
+        """Build the capture output directory for the current run.
+
+        Structure::
+
+            {root}/[{class}/]{env}/run_N/[{trajectory}/]
+
+        Class is optional.  Trajectory subfolder is only added when
+        *traj_name* is provided (i.e. for Record-with-Trajectory); the
+        manual "Setup Writer" button writes directly into ``run_N``.
+        """
+        run = self._current_run_dir(class_name)
+        if traj_name:
+            return os.path.join(run, traj_name)
+        return run
 
     def _refresh_trajectory_lists(self) -> None:
         """Refresh trajectory dropdowns from the trajectory directory."""
@@ -723,27 +759,14 @@ class DataCollectorWindow:
     # ================================================================= #
 
     def _on_setup_writer(self) -> None:
-        """Manual "Setup Writer" button.
+        """Manual "Setup Writer" button — independent of the asset browser.
 
-        Requires a class and asset to be selected in the Asset Browser so
-        the output path stays consistent with record-with-trajectory and
-        we don't scatter files in the environment folder.
+        Writes into the current run folder; the class (if set) scopes the
+        path.  It is fine to use this without any asset loaded — e.g. to
+        capture the scene's default asset.
         """
         class_name = self._asset_browser.class_name
-        asset_stem = self._asset_browser.current_asset_stem
-        if not class_name or not asset_stem:
-            msg = (
-                "Set Class Name and load an asset in the Asset Browser "
-                "before setting up the writer."
-            )
-            self._widgets["data_status"].text = f"Error: {msg}"
-            carb.log_warn(f"[BLV] {msg}")
-            return
-
-        output_dir = self._get_capture_output_dir(
-            class_name=class_name,
-            asset_name=asset_stem,
-        )
+        output_dir = self._get_capture_output_dir(class_name=class_name)
 
         w = self._widgets["res_w"].model.get_value_as_int()
         h = self._widgets["res_h"].model.get_value_as_int()
@@ -757,8 +780,9 @@ class DataCollectorWindow:
             else:
                 self._data_recorder.setup(output_dir, rt_subframes=rt)
             self._widgets["data_status"].text = (
-                f"Status: Writer Ready | Frames: 0"
+                f"Status: Writer Ready → {output_dir}"
             )
+            carb.log_info(f"[BLV] Writer setup → {output_dir}")
         except Exception as exc:
             self._widgets["data_status"].text = f"Status: Setup failed — {exc}"
             carb.log_error(f"[BLV] Writer setup failed: {exc}")
@@ -766,6 +790,8 @@ class DataCollectorWindow:
     def _on_teardown_writer(self) -> None:
         self._data_recorder.teardown()
         self._widgets["data_status"].text = "Status: Not set up | Frames: 0"
+        # Reset run allocation so the next setup gets a fresh run_N
+        self._run_dir = ""
 
     # ================================================================= #
     #  Callbacks — Record with Trajectory                                 #
@@ -789,21 +815,12 @@ class DataCollectorWindow:
             self._widgets["rwt_status"].text = "Error: trajectory file not found"
             return
 
-        # Build output dir from project settings + asset info
+        # Build output dir from project settings + asset info.  Class name
+        # is optional — when empty, data lands at the env level.
         class_name = self._asset_browser.class_name
-        asset_stem = self._asset_browser.current_asset_stem
-        if not class_name or not asset_stem:
-            msg = (
-                "Set Class Name and load an asset in the Asset Browser "
-                "before recording."
-            )
-            self._widgets["rwt_status"].text = f"Error: {msg}"
-            carb.log_warn(f"[BLV] {msg}")
-            return
         traj_stem = os.path.splitext(traj_name)[0]
         output_dir = self._get_capture_output_dir(
             class_name=class_name,
-            asset_name=asset_stem,
             traj_name=traj_stem,
         )
 

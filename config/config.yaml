@@ -23,8 +23,8 @@ rt_subframes: 4
 # asset_root_folder is the parent directory; the class name below is also
 # the subfolder inside it, so assets are scanned at:
 #   {asset_root_folder}/{asset_class_name}/*.usd*
-asset_root_folder: ""
-asset_class_name: ""
+asset_root_folder: "/home/shiven/Desktop/SDG/synthetic_objects"
+asset_class_name: "elevator_button"
 target_prim_path: "/World/TargetAsset"
 
 # --- Data Capture (annotators) ---

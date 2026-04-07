@@ -28,7 +28,7 @@ from typing import List, Optional, Set
 
 import carb
 import omni.usd
-from pxr import Sdf, Usd, UsdGeom
+from pxr import Gf, Sdf, Usd, UsdGeom
 
 
 class AssetBrowser:
@@ -240,6 +240,11 @@ class AssetBrowser:
             prim = stage.DefinePrim(self._target_prim_path, "Xform")
             carb.log_info(f"[BLV] Created target prim at {self._target_prim_path}")
 
+        # Snapshot the target prim's current local transform (if any).
+        # We re-apply it after swapping the reference so that every asset
+        # appears at the same place the user positioned the target prim.
+        saved_translate, saved_rot_xyz, saved_scale = self._read_xform(prim)
+
         try:
             # Clear all existing references on the target prim, then add the
             # new one.  This cleanly swaps to a different asset file.
@@ -249,6 +254,12 @@ class AssetBrowser:
         except Exception as exc:
             carb.log_error(f"[BLV] Failed to set reference on {self._target_prim_path}: {exc}")
             return False
+
+        # Re-apply (or establish) explicit xformOps on the target prim so
+        # they override the asset's internal transforms.  This guarantees
+        # each new asset appears where the user placed the target prim
+        # rather than wherever its own file says.
+        self._write_xform(prim, saved_translate, saved_rot_xyz, saved_scale)
 
         self._current_index = index
 
@@ -260,6 +271,68 @@ class AssetBrowser:
             f"'{os.path.basename(asset_path)}' → {self._target_prim_path}"
         )
         return True
+
+    # ------------------------------------------------------------------ #
+    #  Internal — Transform helpers                                        #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _read_xform(prim: Usd.Prim):
+        """Read translate / rotateXYZ / scale from *prim* if present.
+
+        Returns a tuple of ``(Vec3d translate, Vec3f rotateXYZ, Vec3f scale)``,
+        using identity defaults when an op is missing.
+        """
+        translate = Gf.Vec3d(0.0, 0.0, 0.0)
+        rotate = Gf.Vec3f(0.0, 0.0, 0.0)
+        scale = Gf.Vec3f(1.0, 1.0, 1.0)
+
+        xformable = UsdGeom.Xformable(prim)
+        if not xformable:
+            return translate, rotate, scale
+
+        for op in xformable.GetOrderedXformOps():
+            name = op.GetOpName()
+            val = op.Get()
+            if val is None:
+                continue
+            if name == "xformOp:translate":
+                translate = Gf.Vec3d(val)
+            elif name == "xformOp:rotateXYZ":
+                rotate = Gf.Vec3f(val)
+            elif name == "xformOp:scale":
+                scale = Gf.Vec3f(val)
+        return translate, rotate, scale
+
+    @staticmethod
+    def _write_xform(
+        prim: Usd.Prim,
+        translate: "Gf.Vec3d",
+        rotate_xyz: "Gf.Vec3f",
+        scale: "Gf.Vec3f",
+    ) -> None:
+        """Force-apply explicit translate/rotate/scale xformOps on *prim*.
+
+        This overrides any transforms opinions inherited from referenced
+        USD assets, so the prim always sits where we positioned it.
+        """
+        xformable = UsdGeom.Xformable(prim)
+        if not xformable:
+            return
+
+        # Reset the op order so we own it fully (defensive — also lets us
+        # build up the three ops in a known order).
+        try:
+            xformable.ClearXformOpOrder()
+        except Exception:
+            pass
+
+        t_op = xformable.AddTranslateOp()
+        r_op = xformable.AddRotateXYZOp()
+        s_op = xformable.AddScaleOp()
+        t_op.Set(translate)
+        r_op.Set(rotate_xyz)
+        s_op.Set(scale)
 
     # ------------------------------------------------------------------ #
     #  Internal — Semantic labeling                                       #
