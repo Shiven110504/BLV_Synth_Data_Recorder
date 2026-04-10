@@ -5,12 +5,16 @@
 # at runtime through the UI.
 
 # --- Project ---
-root_folder: "/home/shiven/Desktop/SDG/Synth_Data"
-environment: "hospital_hallway"
+# environment + asset_class_name are typically left blank here so the user
+# enters them in the UI at the start of a session and clicks "Apply Settings"
+# to resolve all derived paths.
+root_folder: "~/Desktop/NeurIPS_Dataset/collected_data"
+environment: ""
+asset_class_name: ""
 
 # --- Camera ---
 camera_path: "/World/BLV_Camera"
-move_speed: 60.0
+move_speed: 20.0
 look_speed: 30.0
 focal_length: 28.0   # in mm — USD uses "tenths of a scene unit"; see camera setup
 
@@ -20,12 +24,11 @@ resolution_height: 720
 rt_subframes: 4
 
 # --- Asset Browser ---
-# asset_root_folder is the parent directory; the class name below is also
-# the subfolder inside it, so assets are scanned at:
+# asset_root_folder is the parent directory; the asset_class_name from the
+# Project section above is also the subfolder name, so assets are scanned at:
 #   {asset_root_folder}/{asset_class_name}/*.usd*
-asset_root_folder: "/home/shiven/Desktop/SDG/synthetic_objects"
-asset_class_name: "elevator_button"
-target_prim_path: "/World/TargetAsset"
+asset_root_folder: "~/Desktop/NeurIPS_Dataset/synthetic_objects"
+parent_prim_path: "/World"
 
 # --- Data Capture (annotators) ---
 # Toggle which annotators the BasicWriter enables.

@@ -99,6 +99,12 @@ class GamepadCameraController:
         self._pitch: float = 0.0
         self._position: Gf.Vec3d = Gf.Vec3d(0.0, 0.0, 0.0)
 
+        # Stage units-per-meter scaler. Isaac Sim's default stage is cm-scaled
+        # (metersPerUnit = 0.01 → 100 units per meter), so move_speed expressed
+        # in m/s must be multiplied by this factor when adding to _position.
+        # Refreshed in _ensure_camera_prim() once a stage is available.
+        self._units_per_meter: float = 100.0
+
         # Raw half-axis values keyed by GamepadInput enum member.
         # Each stick direction is stored independently; signed axes are
         # computed per-frame in _on_update.
@@ -245,6 +251,15 @@ class GamepadCameraController:
         if stage is None:
             carb.log_error("[BLV] No USD stage available.")
             return
+
+        # Cache stage units-per-meter so movement in m/s is honest regardless
+        # of whether the stage is cm-scaled (default) or m-scaled.
+        try:
+            mpu = UsdGeom.GetStageMetersPerUnit(stage)
+            if mpu and mpu > 0.0:
+                self._units_per_meter = 1.0 / mpu
+        except Exception as exc:
+            carb.log_warn(f"[BLV] Could not read stage metersPerUnit: {exc}")
 
         prim = stage.GetPrimAtPath(self._camera_path)
         if not prim.IsValid():
@@ -410,7 +425,13 @@ class GamepadCameraController:
         self._pitch += pitch_in * self._look_speed * dt
 
         # ---- Movement (ground-plane FPS style, Z-up) ----
-        speed = self._move_speed * (self.SLOW_FACTOR if self._slow_mode else 1.0)
+        # move_speed is m/s; multiply by units-per-meter so the displacement
+        # is expressed in stage units (cm by default in Isaac Sim).
+        speed = (
+            self._move_speed
+            * (self.SLOW_FACTOR if self._slow_mode else 1.0)
+            * self._units_per_meter
+        )
         yaw_rad = math.radians(self._yaw)
 
         forward = Gf.Vec3d(-math.sin(yaw_rad), math.cos(yaw_rad), 0.0)

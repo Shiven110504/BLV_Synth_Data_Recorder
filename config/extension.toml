@@ -39,4 +39,5 @@ exts."blv.synth.data_collector".default_resolution_width = 1280
 exts."blv.synth.data_collector".default_resolution_height = 720
 exts."blv.synth.data_collector".default_rt_subframes = 4
 exts."blv.synth.data_collector".default_root_folder = "~/blv_data"
-exts."blv.synth.data_collector".default_environment = "hospital_hallway"
+exts."blv.synth.data_collector".default_environment = ""
+exts."blv.synth.data_collector".default_asset_class_name = ""

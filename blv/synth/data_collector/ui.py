@@ -34,6 +34,7 @@ import carb
 import carb.settings
 import omni.kit.app
 import omni.ui as ui
+import omni.usd
 import yaml
 
 from .asset_browser import AssetBrowser
@@ -93,44 +94,52 @@ class DataCollectorWindow:
         settings = carb.settings.get_settings()
         _ext = "exts.blv.synth.data_collector"
 
-        default_cam = cfg.get("camera_path") or settings.get_as_string(
-            f"/{_ext}/default_camera_path"
-        ) or "/World/BLV_Camera"
-        default_move = cfg.get("move_speed") or settings.get_as_float(
-            f"/{_ext}/default_move_speed"
-        ) or 60.0
-        default_look = cfg.get("look_speed") or settings.get_as_float(
-            f"/{_ext}/default_look_speed"
-        ) or 30.0
-        default_focal = cfg.get("focal_length") or settings.get_as_float(
-            f"/{_ext}/default_focal_length"
-        ) or 28.0
-        default_w = cfg.get("resolution_width") or settings.get_as_int(
-            f"/{_ext}/default_resolution_width"
-        ) or 1280
-        default_h = cfg.get("resolution_height") or settings.get_as_int(
-            f"/{_ext}/default_resolution_height"
-        ) or 720
-        default_rt = cfg.get("rt_subframes") or settings.get_as_int(
-            f"/{_ext}/default_rt_subframes"
-        ) or 4
-        default_root = cfg.get("root_folder") or settings.get_as_string(
-            f"/{_ext}/default_root_folder"
-        ) or "~/blv_data"
-        default_env = cfg.get("environment") or settings.get_as_string(
-            f"/{_ext}/default_environment"
-        ) or "hospital_hallway"
+        # Resolution order for every default below:
+        #   1. config.yaml value (if the key is present — even if empty/0)
+        #   2. carb setting from extension.toml (if non-empty/non-zero)
+        #   3. hard-coded fallback baked into the extension
+        #
+        # Step 1 uses ``key in cfg`` rather than truthiness so an explicit
+        # empty string (e.g. ``environment: ""``) is preserved instead of
+        # silently falling through to the extension.toml default.
+        def _pick_str(key: str, setting_key: str, fallback: str) -> str:
+            if key in cfg and cfg[key] is not None:
+                return str(cfg[key])
+            val = settings.get_as_string(f"/{_ext}/{setting_key}")
+            return val if val else fallback
 
-        # Asset browser defaults from YAML
-        # New semantics: asset_root_folder is the parent dir, class_name is
-        # the subfolder containing the USD files. Falls back to legacy
-        # 'asset_folder' key for backwards compat with older configs.
+        def _pick_num(key: str, setting_key: str, fallback, as_int: bool):
+            if key in cfg and cfg[key] is not None:
+                return cfg[key]
+            val = (
+                settings.get_as_int(f"/{_ext}/{setting_key}")
+                if as_int
+                else settings.get_as_float(f"/{_ext}/{setting_key}")
+            )
+            return val if val else fallback
+
+        default_cam = _pick_str("camera_path", "default_camera_path", "/World/BLV_Camera")
+        default_move = _pick_num("move_speed", "default_move_speed", 60.0, as_int=False)
+        default_look = _pick_num("look_speed", "default_look_speed", 30.0, as_int=False)
+        default_focal = _pick_num("focal_length", "default_focal_length", 28.0, as_int=False)
+        default_w = _pick_num("resolution_width", "default_resolution_width", 1280, as_int=True)
+        default_h = _pick_num("resolution_height", "default_resolution_height", 720, as_int=True)
+        default_rt = _pick_num("rt_subframes", "default_rt_subframes", 4, as_int=True)
+        default_root = _pick_str("root_folder", "default_root_folder", "~/blv_data")
+        # Empty environment / class are valid — the user fills them in the UI
+        # and clicks "Apply Settings" before recording.
+        default_env = _pick_str("environment", "default_environment", "")
+        default_asset_class = _pick_str("asset_class_name", "default_asset_class_name", "")
+
+        # Asset browser defaults from YAML.
+        # asset_root_folder is the parent dir; the class name (now a
+        # project-level setting) is the subfolder containing USD files.
+        # Falls back to legacy 'asset_folder' key for older configs.
         default_asset_root = (
             cfg.get("asset_root_folder")
             or cfg.get("asset_folder", "")
         )
-        default_asset_class = cfg.get("asset_class_name", "")
-        default_target_prim = cfg.get("target_prim_path", "/World/TargetAsset")
+        default_parent_prim = cfg.get("parent_prim_path", "/World")
 
         # Annotator settings from YAML (merged over built-in defaults)
         annotator_cfg = dict(DEFAULT_ANNOTATORS)
@@ -152,27 +161,28 @@ class DataCollectorWindow:
             resolution=(default_w, default_h),
             annotators=annotator_cfg,
         )
-        self._asset_browser = AssetBrowser()
+        self._asset_browser = AssetBrowser(parent_prim_path=default_parent_prim)
         self._annotator_cfg: Dict[str, bool] = annotator_cfg
 
         # Project settings state
         self._root_folder: str = default_root
         self._environment: str = default_env
+        self._class_name: str = default_asset_class
         self._resolution_w: int = default_w
         self._resolution_h: int = default_h
         self._rt_subframes: int = default_rt
 
         # Asset browser defaults from config
         self._default_asset_root: str = default_asset_root
-        self._default_asset_class: str = default_asset_class
-        self._default_target_prim: str = default_target_prim
         self._default_focal_length: float = default_focal
+
+        # Cached ``default_N`` folder name used when no asset is loaded.
+        # Allocated lazily on first capture in a session and reset on
+        # writer teardown so the next session picks a fresh number.
+        self._default_run_name: Optional[str] = None
 
         # Async task handle for "Record with Trajectory"
         self._record_traj_task: Optional[asyncio.Task] = None
-
-        # Lazily-allocated run_N folder for this session (per-window lifetime)
-        self._run_dir: str = ""
 
         # Per-frame UI status updater
         self._status_update_sub = None
@@ -258,36 +268,44 @@ class DataCollectorWindow:
         root = os.path.expanduser(self._root_folder)
         return os.path.join(root, class_name, self._environment)
 
-    def _current_run_dir(self, class_name: str) -> str:
-        """Return (and lazily allocate) the ``run_N`` folder for this session.
+    @staticmethod
+    def _sanitize_folder_name(name: str) -> str:
+        """Make *name* safe to use as a folder component."""
+        return "".join(c if (c.isalnum() or c in "_-.") else "_" for c in name)
 
-        The run number is determined once per window lifetime by scanning
-        the current class+env directory for existing ``run_*`` folders and
-        picking the next available integer.  All recordings made in the
-        same window session share this run folder.  If the caller asks
-        for a different class from the one the cached run belongs to,
-        a fresh run is allocated.
+    def _current_run_name(self, class_name: str) -> str:
+        """Return the run-folder name for the current capture session.
+
+        - If an asset is currently loaded in the Asset Browser, the folder
+          is named after the asset's filename stem (uniquely identifies
+          the asset across the folder).
+        - Otherwise, lazily allocate a ``default_N`` by scanning
+          ``{root}/{class}/{env}/`` for existing ``default_*`` folders and
+          picking the next free integer. Cached for the session so all
+          captures in one writer setup share one folder; reset on
+          ``_on_teardown_writer``.
         """
-        base = self._get_class_env_dir(class_name)
-        if self._run_dir and os.path.dirname(self._run_dir) == base:
-            return self._run_dir
+        stem = self._asset_browser.current_asset_stem
+        if stem:
+            return self._sanitize_folder_name(stem)
 
-        # Allocate a fresh run number
+        if self._default_run_name:
+            return self._default_run_name
+
+        base = self._get_class_env_dir(class_name)
         next_n = 1
         if os.path.isdir(base):
             existing = []
-            for name in os.listdir(base):
-                if name.startswith("run_"):
+            for entry in os.listdir(base):
+                if entry.startswith("default_"):
                     try:
-                        existing.append(int(name[4:]))
+                        existing.append(int(entry[len("default_"):]))
                     except ValueError:
                         pass
             if existing:
                 next_n = max(existing) + 1
-
-        self._run_dir = os.path.join(base, f"run_{next_n}")
-        carb.log_info(f"[BLV] New run directory → {self._run_dir}")
-        return self._run_dir
+        self._default_run_name = f"default_{next_n}"
+        return self._default_run_name
 
     def _get_capture_output_dir(
         self,
@@ -298,13 +316,16 @@ class DataCollectorWindow:
 
         Structure::
 
-            {root}/{class}/{env}/run_N/[{trajectory}/]
+            {root}/{class}/{env}/{asset_stem|default_N}/[{trajectory}/]
 
-        Class is required.  Trajectory subfolder is only added when
-        *traj_name* is provided (i.e. for Record-with-Trajectory); the
-        manual "Setup Writer" button writes directly into ``run_N``.
+        When an asset is loaded the run folder is the asset's filename
+        stem; otherwise a cached ``default_N`` is used. The trajectory
+        subfolder is only added when *traj_name* is provided (i.e. for
+        Record-with-Trajectory); the manual "Setup Writer" button writes
+        directly into the run folder.
         """
-        run = self._current_run_dir(class_name)
+        base = self._get_class_env_dir(class_name)
+        run = os.path.join(base, self._current_run_name(class_name))
         if traj_name:
             return os.path.join(run, traj_name)
         return run
@@ -373,6 +394,16 @@ class DataCollectorWindow:
                         lambda m: self._on_project_setting_changed()
                     )
 
+                # Class Name (used for folder layout, asset scan subfolder,
+                # and the semantic label applied to swapped assets).
+                with ui.HStack(height=_FIELD_HEIGHT):
+                    ui.Label("Class Name:", width=_LABEL_WIDTH)
+                    self._widgets["class_name"] = ui.StringField()
+                    self._widgets["class_name"].model.set_value(self._class_name)
+                    self._widgets["class_name"].model.add_end_edit_fn(
+                        lambda m: self._on_project_setting_changed()
+                    )
+
                 # Resolution
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Resolution:", width=_LABEL_WIDTH)
@@ -415,7 +446,7 @@ class DataCollectorWindow:
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Move Speed:", width=_LABEL_WIDTH)
                     self._widgets["move_speed"] = ui.FloatSlider(
-                        min=0.1, max=200.0
+                        min=0.1, max=50.0
                     )
                     self._widgets["move_speed"].model.set_value(
                         self._camera_ctrl.move_speed
@@ -551,7 +582,7 @@ class DataCollectorWindow:
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Capture every:", width=_LABEL_WIDTH)
                     self._widgets["rwt_frame_step"] = ui.IntField(width=60)
-                    self._widgets["rwt_frame_step"].model.set_value(1)
+                    self._widgets["rwt_frame_step"].model.set_value(50)
                     ui.Label(" frames  (1 = every frame)", width=180)
 
                 with ui.HStack(height=_BUTTON_HEIGHT):
@@ -586,23 +617,37 @@ class DataCollectorWindow:
                     self._widgets["ab_folder"].model.set_value(self._default_asset_root)
                     ui.Button("...", width=30, clicked_fn=self._on_browse_asset_folder)
 
-                with ui.HStack(height=_FIELD_HEIGHT):
-                    ui.Label("Class Name:", width=_LABEL_WIDTH)
-                    self._widgets["ab_class"] = ui.StringField()
-                    self._widgets["ab_class"].model.set_value(self._default_asset_class)
-                    ui.Label("(= subfolder)", width=100)
-                    # When the class changes, re-derive the trajectory
-                    # directory so new recordings land under the right
-                    # class-scoped folder.
-                    self._widgets["ab_class"].model.add_end_edit_fn(
-                        lambda m: self._apply_project_paths()
+                # Spawn Transform — "From Selection" reads the selected
+                # prim's world transform and uses it as the initial spawn
+                # position.  Subsequent swaps read the current prim's
+                # transform so user adjustments persist.
+                with ui.HStack(height=_BUTTON_HEIGHT):
+                    ui.Button(
+                        "From Selection",
+                        clicked_fn=self._on_capture_spawn_transform,
+                        tooltip="Capture position/orientation/scale from the selected prim",
                     )
 
                 with ui.HStack(height=_FIELD_HEIGHT):
-                    ui.Label("Target Prim:", width=_LABEL_WIDTH)
-                    self._widgets["ab_target"] = ui.StringField()
-                    self._widgets["ab_target"].model.set_value(self._default_target_prim)
-                    ui.Button("Pick", width=50, clicked_fn=self._on_pick_target_prim)
+                    ui.Label("Position:", width=_LABEL_WIDTH)
+                    for axis in ("x", "y", "z"):
+                        ui.Label(f"{axis}:", width=12)
+                        self._widgets[f"ab_pos_{axis}"] = ui.FloatField(width=70, read_only=True)
+                        self._widgets[f"ab_pos_{axis}"].model.set_value(0.0)
+
+                with ui.HStack(height=_FIELD_HEIGHT):
+                    ui.Label("Orientation:", width=_LABEL_WIDTH)
+                    for axis in ("w", "x", "y", "z"):
+                        ui.Label(f"{axis}:", width=12)
+                        self._widgets[f"ab_orient_{axis}"] = ui.FloatField(width=55, read_only=True)
+                    self._widgets["ab_orient_w"].model.set_value(1.0)
+
+                with ui.HStack(height=_FIELD_HEIGHT):
+                    ui.Label("Scale:", width=_LABEL_WIDTH)
+                    for axis in ("x", "y", "z"):
+                        ui.Label(f"{axis}:", width=12)
+                        self._widgets[f"ab_scale_{axis}"] = ui.FloatField(width=70, read_only=True)
+                        self._widgets[f"ab_scale_{axis}"].model.set_value(1.0)
 
                 with ui.HStack(height=_BUTTON_HEIGHT):
                     ui.Button("Prev", clicked_fn=self._on_prev_asset)
@@ -620,15 +665,22 @@ class DataCollectorWindow:
     # ================================================================= #
 
     def _on_project_setting_changed(self) -> None:
-        """Called when root folder or environment fields are edited."""
+        """Called when root folder, environment, or class fields are edited."""
         self._root_folder = self._widgets["root_folder"].model.get_value_as_string().strip()
         self._environment = self._widgets["environment"].model.get_value_as_string().strip()
+        self._class_name = self._widgets["class_name"].model.get_value_as_string().strip()
         self._apply_project_paths()
 
     def _on_apply_project_settings(self) -> None:
-        """Read all project settings from UI and apply them."""
+        """Read all project settings from UI, apply them, and resolve folders.
+
+        Resolves the trajectory directory, refreshes the trajectory list,
+        rescans the asset folder for the current class, and pushes the
+        class name onto the asset browser as the semantic label.
+        """
         self._root_folder = self._widgets["root_folder"].model.get_value_as_string().strip()
         self._environment = self._widgets["environment"].model.get_value_as_string().strip()
+        self._class_name = self._widgets["class_name"].model.get_value_as_string().strip()
         self._resolution_w = self._widgets["res_w"].model.get_value_as_int()
         self._resolution_h = self._widgets["res_h"].model.get_value_as_int()
         self._rt_subframes = self._widgets["rt_subframes"].model.get_value_as_int()
@@ -637,22 +689,23 @@ class DataCollectorWindow:
         self._data_recorder.resolution = (self._resolution_w, self._resolution_h)
         self._data_recorder.rt_subframes = self._rt_subframes
 
-        # Update data capture info labels
-        if "data_res_label" in self._widgets:
-            self._widgets["data_res_label"].text = (
-                f"Resolution: {self._resolution_w} x {self._resolution_h}"
-            )
-        if "data_rt_label" in self._widgets:
-            self._widgets["data_rt_label"].text = (
-                f"RT Subframes: {self._rt_subframes}"
-            )
+        # Push class name onto the asset browser so the semantic label is
+        # always in sync with the project settings.
+        self._asset_browser.class_name = self._class_name
 
-        # Apply paths
+        # Apply paths (resolves trajectory dir, refreshes trajectory list)
         self._apply_project_paths()
+
+        # Rescan the asset folder for the new class subfolder so the
+        # browser is ready to swap as soon as the user clicks Prev/Next.
+        ab_root = self._widgets.get("ab_folder")
+        if ab_root is not None and self._class_name:
+            self._scan_asset_folder(ab_root.model.get_value_as_string().strip())
+
         carb.log_info(
             f"[BLV] Project settings applied: root={self._root_folder}, "
-            f"env={self._environment}, res={self._resolution_w}x{self._resolution_h}, "
-            f"rt={self._rt_subframes}"
+            f"env={self._environment}, class={self._class_name}, "
+            f"res={self._resolution_w}x{self._resolution_h}, rt={self._rt_subframes}"
         )
 
     # ================================================================= #
@@ -665,8 +718,11 @@ class DataCollectorWindow:
             carb.log_warn("[BLV] Camera path is empty.")
             return
         self._camera_ctrl.camera_path = path
-        # Sync to data recorder as well
-        self._data_recorder.camera_path = path
+        # Sync to data recorder only if it's not actively capturing
+        if not self._data_recorder.is_setup:
+            self._data_recorder.camera_path = path
+        else:
+            carb.log_info("[BLV] Data recorder active — camera path change deferred to next setup.")
         carb.log_info(f"[BLV] Camera path updated → {path}")
 
     def _on_enable_gamepad(self) -> None:
@@ -683,11 +739,7 @@ class DataCollectorWindow:
     # ================================================================= #
 
     def _on_start_recording(self) -> None:
-        class_name = self._current_class_name()
-        if not class_name:
-            msg = "Class Name is required — set it in the Asset Browser."
-            self._widgets["traj_rec_status"].text = f"Error: {msg}"
-            carb.log_warn(f"[BLV] {msg}")
+        if not self._require_project_context("traj_rec_status"):
             return
 
         # Make sure the trajectory manager writes into the class-scoped dir
@@ -776,18 +828,14 @@ class DataCollectorWindow:
 
         Does NOT require an asset to be loaded in the Asset Browser — this
         is intentional so the user can capture the scene's default asset.
-        It DOES require the Class Name field to be set, because the output
-        path is ``{root}/{class}/{env}/run_N/`` and we refuse to scatter
-        data into the environment folder when no class is specified.
+        It DOES require Environment + Class Name to be set, because the
+        output path is ``{root}/{class}/{env}/{object}/`` and we refuse to
+        scatter data into incomplete folders.
         """
-        class_name = self._current_class_name()
-        if not class_name:
-            msg = "Class Name is required — set it in the Asset Browser."
-            self._widgets["data_status"].text = f"Error: {msg}"
-            carb.log_warn(f"[BLV] {msg}")
+        if not self._require_project_context("data_status"):
             return
 
-        output_dir = self._get_capture_output_dir(class_name=class_name)
+        output_dir = self._get_capture_output_dir(class_name=self._current_class_name())
 
         w = self._widgets["res_w"].model.get_value_as_int()
         h = self._widgets["res_h"].model.get_value_as_int()
@@ -811,8 +859,8 @@ class DataCollectorWindow:
     def _on_teardown_writer(self) -> None:
         self._data_recorder.teardown()
         self._widgets["data_status"].text = "Status: Not set up | Frames: 0"
-        # Reset run allocation so the next setup gets a fresh run_N
-        self._run_dir = ""
+        # Drop the cached default_N so the next session picks a fresh number
+        self._default_run_name = None
 
     # ================================================================= #
     #  Callbacks — Record with Trajectory                                 #
@@ -836,18 +884,14 @@ class DataCollectorWindow:
             self._widgets["rwt_status"].text = "Error: trajectory file not found"
             return
 
-        # Class is required — scopes the output path under
-        # {root}/{class}/{env}/run_N/{trajectory}/
-        class_name = self._current_class_name()
-        if not class_name:
-            msg = "Class Name is required — set it in the Asset Browser."
-            self._widgets["rwt_status"].text = f"Error: {msg}"
-            carb.log_warn(f"[BLV] {msg}")
+        # Env + Class are required — scope the output under
+        # {root}/{class}/{env}/{object}/{trajectory}/
+        if not self._require_project_context("rwt_status"):
             return
 
         traj_stem = os.path.splitext(traj_name)[0]
         output_dir = self._get_capture_output_dir(
-            class_name=class_name,
+            class_name=self._current_class_name(),
             traj_name=traj_stem,
         )
 
@@ -912,8 +956,8 @@ class DataCollectorWindow:
         # By keeping one render product alive and only swapping the writer,
         # we sidestep that entirely.
         recorder = self._data_recorder
-        recorder.camera_path = self._camera_ctrl.camera_path
         if not recorder.is_setup:
+            recorder.camera_path = self._camera_ctrl.camera_path
             recorder.resolution = resolution
             recorder.annotators = self._annotator_cfg
 
@@ -997,11 +1041,10 @@ class DataCollectorWindow:
 
         The asset browser expects a **root** directory that contains one
         subfolder per class (e.g. ``root/elevator_button/*.usdz``).  The
-        class name comes from the "Class Name" field and doubles as the
-        semantic label applied to loaded assets.
+        class name comes from the Project Settings "Class Name" field and
+        doubles as the semantic label applied to loaded assets.
         """
-        cls = self._widgets["ab_class"].model.get_value_as_string().strip()
-        target = self._widgets["ab_target"].model.get_value_as_string().strip()
+        cls = self._current_class_name()
 
         # Normalize the root, then compose the actual scan folder
         root_folder = os.path.normpath(os.path.expanduser(root_folder))
@@ -1020,16 +1063,38 @@ class DataCollectorWindow:
             self._widgets["ab_status"].text = f"Error: {scan_folder} not found"
             return
 
-        self._asset_browser.set_target_prim(target)
         count = self._asset_browser.set_folder(scan_folder, class_name=cls)
         self._widgets["ab_status"].text = f"Found {count} USD files"
         self._widgets["ab_current"].text = "Current: None"
 
     def _current_class_name(self) -> str:
-        """Return the Asset Browser's Class Name field, stripped."""
-        if "ab_class" not in self._widgets:
-            return ""
-        return self._widgets["ab_class"].model.get_value_as_string().strip()
+        """Return the Project Settings Class Name field, stripped."""
+        if "class_name" not in self._widgets:
+            return self._class_name
+        return self._widgets["class_name"].model.get_value_as_string().strip()
+
+    def _current_environment(self) -> str:
+        """Return the Project Settings Environment field, stripped."""
+        if "environment" not in self._widgets:
+            return self._environment
+        return self._widgets["environment"].model.get_value_as_string().strip()
+
+    def _require_project_context(self, status_widget_key: str) -> bool:
+        """Guard for capture/record actions that need env + class to be set.
+
+        Writes a user-facing error to ``self._widgets[status_widget_key]``
+        and logs a warning when either field is empty. Returns True only
+        when both are set so callers can early-return on False.
+        """
+        env = self._current_environment()
+        cls = self._current_class_name()
+        missing = [n for n, v in (("Environment", env), ("Class Name", cls)) if not v]
+        if missing:
+            msg = f"{' and '.join(missing)} required — set in Project Settings, then click Apply Settings."
+            self._widgets[status_widget_key].text = f"Error: {msg}"
+            carb.log_warn(f"[BLV] {msg}")
+            return False
+        return True
 
     def _expected_scan_folder(self) -> str:
         """Compose the expected scan folder from the UI root + class fields."""
@@ -1060,21 +1125,28 @@ class DataCollectorWindow:
         success = self._asset_browser.previous_asset()
         self._update_asset_browser_labels(success)
 
-    def _on_pick_target_prim(self) -> None:
-        """Placeholder for a prim picker. For now, just sync the field."""
-        target = self._widgets["ab_target"].model.get_value_as_string().strip()
-        if target:
-            self._asset_browser.set_target_prim(target)
-            carb.log_info(f"[BLV] Target prim set to {target}")
+    def _on_capture_spawn_transform(self) -> None:
+        """Capture the selected prim's world transform as the spawn position."""
+        try:
+            sel = omni.usd.get_context().get_selection().get_selected_prim_paths()
+        except Exception as exc:
+            carb.log_warn(f"[BLV] Could not read viewport selection: {exc}")
+            return
+        if not sel:
+            self._widgets["ab_status"].text = "Select a prim first"
+            carb.log_warn("[BLV] No prim selected.")
+            return
+        if self._asset_browser.capture_transform_from_prim(sel[0]):
+            self._update_spawn_transform_fields()
+            self._widgets["ab_status"].text = f"Transform captured from {sel[0]}"
+        else:
+            self._widgets["ab_status"].text = "Failed to capture transform"
 
     def _sync_asset_browser_fields(self) -> None:
         """Push current UI field values into the AssetBrowser instance."""
-        cls = self._widgets["ab_class"].model.get_value_as_string().strip()
-        target = self._widgets["ab_target"].model.get_value_as_string().strip()
+        cls = self._current_class_name()
         if cls:
             self._asset_browser.class_name = cls
-        if target:
-            self._asset_browser.target_prim_path = target
 
     def _update_asset_browser_labels(self, success: bool) -> None:
         idx = self._asset_browser.current_index
@@ -1082,6 +1154,31 @@ class DataCollectorWindow:
         name = self._asset_browser.current_asset_name
         self._widgets["ab_status"].text = f"Asset {idx + 1}/{total}"
         self._widgets["ab_current"].text = f"Current: {name}"
+        if success:
+            self._update_spawn_transform_fields()
+
+    def _update_spawn_transform_fields(self) -> None:
+        """Refresh the read-only fields from the browser's stored spawn transform."""
+        self._update_spawn_transform_fields_from(
+            self._asset_browser.spawn_translate,
+            self._asset_browser.spawn_orient,
+            self._asset_browser.spawn_scale,
+        )
+
+    def _update_spawn_transform_fields_from(
+        self, t: "Gf.Vec3d", o: "Gf.Quatd", s: "Gf.Vec3d"
+    ) -> None:
+        """Write position/orientation/scale values into the read-only UI fields."""
+        self._widgets["ab_pos_x"].model.set_value(t[0])
+        self._widgets["ab_pos_y"].model.set_value(t[1])
+        self._widgets["ab_pos_z"].model.set_value(t[2])
+        self._widgets["ab_orient_w"].model.set_value(o.GetReal())
+        self._widgets["ab_orient_x"].model.set_value(o.GetImaginary()[0])
+        self._widgets["ab_orient_y"].model.set_value(o.GetImaginary()[1])
+        self._widgets["ab_orient_z"].model.set_value(o.GetImaginary()[2])
+        self._widgets["ab_scale_x"].model.set_value(s[0])
+        self._widgets["ab_scale_y"].model.set_value(s[1])
+        self._widgets["ab_scale_z"].model.set_value(s[2])
 
     # ================================================================= #
     #  Per-frame status updater                                           #
@@ -1124,6 +1221,11 @@ class DataCollectorWindow:
             self._widgets["data_status"].text = (
                 f"Status: Writer Ready | Frames: {self._data_recorder.frame_count}"
             )
+
+        # Asset browser — live transform display
+        xform = self._asset_browser.read_current_prim_transform()
+        if xform is not None:
+            self._update_spawn_transform_fields_from(xform[0], xform[1], xform[2])
 
     # ================================================================= #
     #  Teardown                                                           #
