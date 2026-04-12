@@ -13,6 +13,7 @@ Controls
     Left trigger        Move down
     D-pad up / down     Increase / decrease move speed
     Left bumper         Toggle slow mode (0.25×)
+    X button            Toggle trajectory recording (start / stop & save)
 
 Coordinate system
 -----------------
@@ -36,7 +37,7 @@ Implementation notes
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import carb
 import carb.input
@@ -93,6 +94,11 @@ class GamepadCameraController:
 
         self._enabled: bool = False
         self._slow_mode: bool = False
+
+        # Optional callback fired when the X button is pressed.
+        # Wired by the UI so the user can start / stop trajectory recording
+        # without letting go of the gamepad.
+        self.record_toggle_callback: Optional[Callable[[], None]] = None
 
         # Camera state — Z-up Euler angles in degrees
         self._yaw: float = 0.0
@@ -368,6 +374,12 @@ class GamepadCameraController:
         elif inp == G.LEFT_SHOULDER and val > 0.5:
             self._slow_mode = not self._slow_mode
             carb.log_info(f"[BLV] Slow mode {'ON' if self._slow_mode else 'OFF'}")
+        elif inp == G.X and val > 0.5:
+            if self.record_toggle_callback is not None:
+                try:
+                    self.record_toggle_callback()
+                except Exception as exc:
+                    carb.log_error(f"[BLV] record_toggle_callback raised: {exc}")
 
         return True
 

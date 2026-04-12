@@ -154,6 +154,8 @@ class DataCollectorWindow:
             focal_length=default_focal,
         )
         self._traj_recorder = TrajectoryRecorder(self._camera_ctrl)
+        # Let the gamepad's X button toggle trajectory recording
+        self._camera_ctrl.record_toggle_callback = self._toggle_trajectory_recording
         self._traj_player = TrajectoryPlayer(self._camera_ctrl)
         self._traj_manager = TrajectoryManager()
         self._data_recorder = DataRecorder(
@@ -752,6 +754,12 @@ class DataCollectorWindow:
         self._traj_recorder.start_recording(
             name=name, environment=self._environment
         )
+
+    def _toggle_trajectory_recording(self) -> None:
+        if self._traj_recorder.is_recording:
+            self._on_stop_recording()
+        else:
+            self._on_start_recording()
 
     def _on_stop_recording(self) -> None:
         if not self._traj_recorder.is_recording:
