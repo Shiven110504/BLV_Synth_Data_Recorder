@@ -1,3 +1,6 @@
+[core]
+reloadable = false
+
 [package]
 version = "2.0.0"
 title = "BLV Synth Data Collector"

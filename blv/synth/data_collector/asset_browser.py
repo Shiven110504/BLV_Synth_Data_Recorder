@@ -238,11 +238,23 @@ class AssetBrowser:
         prev_idx = (self._current_index - 1) % len(self._assets)
         return self.load_asset(prev_idx)
 
-    def load_asset(self, index: int) -> bool:
+    def load_asset(self, index: int, preserve_transform: bool = True) -> bool:
         """Load a specific asset by index.
 
         Deletes the current prim, creates a new one with a USD reference,
         applies the spawn transform, and sets the semantic label.
+
+        Parameters
+        ----------
+        index : int
+            Index into the scanned asset list.
+        preserve_transform : bool
+            When ``True`` (default), the current prim's local xformOps are
+            read before deletion so the next asset inherits any user
+            adjustments (used by Prev/Next navigation).  Set to ``False``
+            when an explicit transform was already pushed via
+            :meth:`set_spawn_transform` (e.g. during a location switch) —
+            otherwise the snapshot would overwrite the desired transform.
         """
         if index < 0 or index >= len(self._assets):
             carb.log_error(f"[BLV] Asset index {index} out of range [0, {len(self._assets)}).")
@@ -267,7 +279,9 @@ class AssetBrowser:
         # deleting, so the next asset inherits any user adjustments.
         # Uses _read_local_xform_ops (not world transform) to avoid
         # baking in the referenced USD's internal transforms.
-        if self._current_prim_path:
+        # Skipped when preserve_transform is False (caller already pushed
+        # the desired transform via set_spawn_transform).
+        if preserve_transform and self._current_prim_path:
             existing = stage.GetPrimAtPath(self._current_prim_path)
             if existing.IsValid():
                 t, r, s = self._read_local_xform_ops(existing)

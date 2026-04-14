@@ -217,7 +217,7 @@ class DataRecorder:
         except Exception as exc:
             carb.log_error(f"[BLV] DataRecorder setup failed: {exc}")
             # Attempt partial cleanup
-            self._cleanup_partial()
+            self._release_resources()
             raise
 
     def _build_writer(self, output_dir: str):
@@ -302,44 +302,38 @@ class DataRecorder:
 
         Safe to call even if setup was never called (no-op in that case).
         """
+        if self._is_setup:
+            carb.log_info(
+                f"[BLV] DataRecorder teardown — {self._frame_count} frames captured "
+                f"to {self._output_dir}"
+            )
+        self._release_resources(log_warnings=True)
+
+    # ------------------------------------------------------------------ #
+    #  Internal                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _release_resources(self, log_warnings: bool = False) -> None:
+        """Detach writer and destroy render product.
+
+        Called by both :meth:`teardown` (normal) and after failed setup
+        (best-effort).  When *log_warnings* is ``False``, exceptions are
+        silently swallowed.
+        """
         if self._writer is not None:
             try:
                 self._writer.detach()
             except Exception as exc:
-                carb.log_warn(f"[BLV] Writer detach warning: {exc}")
+                if log_warnings:
+                    carb.log_warn(f"[BLV] Writer detach warning: {exc}")
             self._writer = None
 
         if self._render_product is not None:
             try:
                 self._render_product.destroy()
             except Exception as exc:
-                carb.log_warn(f"[BLV] Render product destroy warning: {exc}")
+                if log_warnings:
+                    carb.log_warn(f"[BLV] Render product destroy warning: {exc}")
             self._render_product = None
 
-        if self._is_setup:
-            carb.log_info(
-                f"[BLV] DataRecorder teardown — {self._frame_count} frames captured "
-                f"to {self._output_dir}"
-            )
-        self._is_setup = False
-
-    # ------------------------------------------------------------------ #
-    #  Internal                                                           #
-    # ------------------------------------------------------------------ #
-
-    def _cleanup_partial(self) -> None:
-        """Best-effort cleanup after a failed setup."""
-        try:
-            if self._writer is not None:
-                self._writer.detach()
-        except Exception:
-            pass
-        self._writer = None
-
-        try:
-            if self._render_product is not None:
-                self._render_product.destroy()
-        except Exception:
-            pass
-        self._render_product = None
         self._is_setup = False

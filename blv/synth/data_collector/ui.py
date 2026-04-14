@@ -36,10 +36,12 @@ import omni.kit.app
 import omni.ui as ui
 import omni.usd
 import yaml
+from pxr import Gf
 
 from .asset_browser import AssetBrowser
 from .data_recorder import DEFAULT_ANNOTATORS, DataRecorder, get_enabled_annotator_names
 from .gamepad_camera import GamepadCameraController
+from .location import LocationManager
 from .trajectory import TrajectoryManager, TrajectoryPlayer, TrajectoryRecorder
 
 
@@ -164,6 +166,7 @@ class DataCollectorWindow:
             annotators=annotator_cfg,
         )
         self._asset_browser = AssetBrowser(parent_prim_path=default_parent_prim)
+        self._location_manager = LocationManager()
         self._annotator_cfg: Dict[str, bool] = annotator_cfg
 
         # Project settings state
@@ -185,6 +188,9 @@ class DataCollectorWindow:
 
         # Async task handle for "Record with Trajectory"
         self._record_traj_task: Optional[asyncio.Task] = None
+
+        # Guard flag to prevent recursive location ComboBox updates
+        self._refreshing_locations: bool = False
 
         # Per-frame UI status updater
         self._status_update_sub = None
@@ -244,31 +250,56 @@ class DataCollectorWindow:
 
         Trajectory dir follows the class-scoped structure::
 
-            {root}/{class}/{environment}/trajectories/
+            {root}/{class}/{environment}/[{location}/]trajectories/
 
         When no class has been set yet, the trajectory manager's directory
         is left cleared; the user will be prompted to set a class before
         any recording is allowed.
         """
-        root = os.path.expanduser(self._root_folder)
+        root = self._normalize_path(self._root_folder)
         env = self._environment
         cls = self._current_class_name()
+        loc = self._location_manager.current_location
+
+        # Keep the location manager's base directory in sync
+        if cls and env:
+            self._location_manager.set_base_directory(root, cls, env)
 
         if cls:
-            self._traj_manager.set_project_paths(root, env, class_name=cls)
+            self._traj_manager.set_project_paths(
+                root, env, class_name=cls, location=loc
+            )
         else:
             self._traj_manager.directory = ""
 
-        # Refresh trajectory list in UI
+        # Refresh location list and trajectory list in UI
+        self._refresh_location_list()
         self._refresh_trajectory_lists()
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        """Expand ``~`` and normalize a filesystem path."""
+        return os.path.normpath(os.path.expanduser(path))
 
     def _get_class_env_dir(self, class_name: str) -> str:
         """Base directory for the current class + environment.
 
         ``{root}/{class}/{env}`` — class is **required**.
         """
-        root = os.path.expanduser(self._root_folder)
+        root = self._normalize_path(self._root_folder)
         return os.path.join(root, class_name, self._environment)
+
+    def _get_location_dir(self, class_name: str) -> str:
+        """Base directory scoped to the active location (if any).
+
+        Returns ``{root}/{class}/{env}/{location}`` when a location is
+        selected, otherwise falls back to ``{root}/{class}/{env}``.
+        """
+        base = self._get_class_env_dir(class_name)
+        loc = self._location_manager.current_location
+        if loc:
+            return os.path.join(base, loc)
+        return base
 
     @staticmethod
     def _sanitize_folder_name(name: str) -> str:
@@ -282,10 +313,10 @@ class DataCollectorWindow:
           is named after the asset's filename stem (uniquely identifies
           the asset across the folder).
         - Otherwise, lazily allocate a ``default_N`` by scanning
-          ``{root}/{class}/{env}/`` for existing ``default_*`` folders and
-          picking the next free integer. Cached for the session so all
-          captures in one writer setup share one folder; reset on
-          ``_on_teardown_writer``.
+          the current location/env directory for existing ``default_*``
+          folders and picking the next free integer. Cached for the
+          session so all captures in one writer setup share one folder;
+          reset on ``_on_teardown_writer``.
         """
         stem = self._asset_browser.current_asset_stem
         if stem:
@@ -294,7 +325,7 @@ class DataCollectorWindow:
         if self._default_run_name:
             return self._default_run_name
 
-        base = self._get_class_env_dir(class_name)
+        base = self._get_location_dir(class_name)
         next_n = 1
         if os.path.isdir(base):
             existing = []
@@ -318,7 +349,7 @@ class DataCollectorWindow:
 
         Structure::
 
-            {root}/{class}/{env}/{asset_stem|default_N}/[{trajectory}/]
+            {root}/{class}/{env}/[{location}/]{asset_stem|default_N}/[{trajectory}/]
 
         When an asset is loaded the run folder is the asset's filename
         stem; otherwise a cached ``default_N`` is used. The trajectory
@@ -326,35 +357,27 @@ class DataCollectorWindow:
         Record-with-Trajectory); the manual "Setup Writer" button writes
         directly into the run folder.
         """
-        base = self._get_class_env_dir(class_name)
+        base = self._get_location_dir(class_name)
         run = os.path.join(base, self._current_run_name(class_name))
         if traj_name:
             return os.path.join(run, traj_name)
         return run
 
+    def _repopulate_combo(self, combo_key: str, items: list) -> None:
+        """Clear and repopulate a ComboBox widget with *items*."""
+        if combo_key not in self._widgets:
+            return
+        model = self._widgets[combo_key].model
+        for child in model.get_item_children(None):
+            model.remove_item(child)
+        for item in items:
+            model.append_child_item(None, ui.SimpleStringModel(item))
+
     def _refresh_trajectory_lists(self) -> None:
         """Refresh trajectory dropdowns from the trajectory directory."""
         names = self._traj_manager.list_trajectory_names()
-
-        # Update playback dropdown
-        if "traj_play_combo" in self._widgets:
-            combo = self._widgets["traj_play_combo"]
-            model = combo.model
-            children = model.get_item_children(None)
-            for child in children:
-                model.remove_item(child)
-            for name in names:
-                model.append_child_item(None, ui.SimpleStringModel(name))
-
-        # Update record-with-trajectory dropdown
-        if "rwt_traj_combo" in self._widgets:
-            combo = self._widgets["rwt_traj_combo"]
-            model = combo.model
-            children = model.get_item_children(None)
-            for child in children:
-                model.remove_item(child)
-            for name in names:
-                model.append_child_item(None, ui.SimpleStringModel(name))
+        self._repopulate_combo("traj_play_combo", names)
+        self._repopulate_combo("rwt_traj_combo", names)
 
         # Update saved trajectory list label
         if "traj_saved_list" in self._widgets:
@@ -427,6 +450,195 @@ class DataCollectorWindow:
                         "Apply Settings",
                         clicked_fn=self._on_apply_project_settings,
                     )
+
+    # ---- Location callbacks ------------------------------------------ #
+
+    def _refresh_location_list(self) -> None:
+        """Repopulate the location ComboBox from disk."""
+        if "loc_combo" not in self._widgets:
+            return
+        # Guard against recursion: modifying the ComboBox model fires
+        # the item_changed callback which may call _apply_project_paths
+        # which calls us again.
+        self._refreshing_locations = True
+        try:
+            locations = self._location_manager.list_locations()
+            self._repopulate_combo("loc_combo", locations)
+
+            # If a location was previously selected and still exists, re-select it
+            current = self._location_manager.current_location
+            if current and current in locations:
+                idx = locations.index(current)
+                self._widgets["loc_combo"].model.get_item_value_model().set_value(idx)
+            else:
+                self._location_manager.current_location = ""
+                if not locations:
+                    self._widgets["loc_status"].text = "No location selected"
+        finally:
+            self._refreshing_locations = False
+
+    def _on_location_combo_changed(self, model, item) -> None:
+        """Called when the user picks a different location from the dropdown."""
+        # Skip if we're programmatically refreshing the dropdown
+        if getattr(self, "_refreshing_locations", False):
+            return
+        current_item = model.get_item_value_model()
+        if current_item is None:
+            return
+        idx = current_item.get_value_as_int()
+        locations = self._location_manager.list_locations()
+        if idx < 0 or idx >= len(locations):
+            return
+        name = locations[idx]
+
+        # Save the departing location's current transform before switching
+        self._auto_save_location_transform()
+
+        self._switch_to_location(name)
+
+    def _switch_to_location(self, name: str) -> None:
+        """Switch to a named location: load its transform, reload the asset,
+        and update trajectory paths.
+
+        Uses :meth:`load_asset` (the full delete/recreate cycle) rather than
+        ``apply_current_transform`` so that the prim's xformOps are set on a
+        clean slate — this is required for unit-conversion scale to resolve
+        correctly in the viewport properties panel.
+        """
+        self._location_manager.current_location = name
+
+        # Load transform from disk
+        try:
+            data = self._location_manager.load_location(name)
+            xform = data.get("spawn_transform", {})
+            t = xform.get("translate", [0, 0, 0])
+            o = xform.get("orient", [1, 0, 0, 0])
+            s = xform.get("scale", [1, 1, 1])
+
+            translate = Gf.Vec3d(*t)
+            orient = Gf.Quatd(o[0], o[1], o[2], o[3])
+            scale = Gf.Vec3d(*s)
+
+            self._asset_browser.set_spawn_transform(translate, orient, scale)
+
+        except Exception as exc:
+            carb.log_warn(f"[BLV] Failed to load location '{name}': {exc}")
+            self._widgets["loc_status"].text = f"Error loading location: {exc}"
+            self._location_manager.current_location = ""
+            return
+
+        # Reload the asset via the full delete/recreate pipeline so
+        # xformOps are applied to a fresh prim (matches Prev/Next behaviour).
+        # preserve_transform=False tells load_asset NOT to snapshot the
+        # current prim's transform (which would overwrite the new location's
+        # transform we just set above).
+        asset_idx = self._asset_browser.current_index
+        if asset_idx >= 0:
+            self._sync_asset_browser_fields()
+            success = self._asset_browser.load_asset(asset_idx, preserve_transform=False)
+            self._update_asset_browser_labels(success)
+        else:
+            # No asset loaded yet — ensure the scan folder is current, then
+            # load the first asset if available.
+            root = self._widgets["ab_folder"].model.get_value_as_string().strip()
+            if self._expected_scan_folder() != self._asset_browser.asset_folder:
+                self._scan_asset_folder(root)
+            if self._asset_browser.total_assets > 0:
+                self._sync_asset_browser_fields()
+                success = self._asset_browser.load_asset(0, preserve_transform=False)
+                self._update_asset_browser_labels(success)
+
+        self._update_spawn_transform_fields()
+
+        # Update trajectory paths for this location
+        self._apply_project_paths()
+
+        self._widgets["loc_status"].text = f"Location: {name}"
+        carb.log_info(f"[BLV] Switched to location '{name}'")
+
+    def _on_new_location_clicked(self) -> None:
+        """Show the inline name field for creating a new location."""
+        self._widgets["loc_new_row"].visible = True
+        self._widgets["loc_name_field"].model.set_value("")
+
+    def _on_cancel_new_location(self) -> None:
+        self._widgets["loc_new_row"].visible = False
+
+    def _on_create_location(self) -> None:
+        """Validate the name and create a new location with the current transform."""
+        name = self._widgets["loc_name_field"].model.get_value_as_string().strip()
+
+        # Need env + class to know where to create the location
+        cls = self._current_class_name()
+        env = self._current_environment()
+        if not cls or not env:
+            self._widgets["loc_status"].text = (
+                "Error: Set Environment and Class Name first."
+            )
+            return
+
+        # Ensure the location manager knows the base directory
+        self._location_manager.set_base_directory(
+            self._normalize_path(self._root_folder), cls, env
+        )
+
+        ok, err = self._location_manager.validate_name(name)
+        if not ok:
+            self._widgets["loc_status"].text = f"Error: {err}"
+            return
+
+        # Use the current asset transform (or defaults) as the initial spawn
+        xform = self._asset_browser.read_current_prim_transform()
+        if xform is not None:
+            t, o, s = xform
+        else:
+            t = self._asset_browser.spawn_translate
+            o = self._asset_browser.spawn_orient
+            s = self._asset_browser.spawn_scale
+
+        translate = [t[0], t[1], t[2]]
+        orient = [o.GetReal(), o.GetImaginary()[0], o.GetImaginary()[1], o.GetImaginary()[2]]
+        scale = [s[0], s[1], s[2]]
+
+        try:
+            self._location_manager.create_location(name, translate, orient, scale)
+        except Exception as exc:
+            self._widgets["loc_status"].text = f"Error: {exc}"
+            return
+
+        self._widgets["loc_new_row"].visible = False
+
+        # Refresh dropdown and select the new location
+        self._location_manager.current_location = name
+        self._refresh_location_list()
+        self._apply_project_paths()
+
+        # Auto-load the first asset if none is currently loaded
+        if not self._asset_browser.current_prim_path:
+            root = self._widgets["ab_folder"].model.get_value_as_string().strip()
+            if self._expected_scan_folder() != self._asset_browser.asset_folder:
+                self._scan_asset_folder(root)
+            if self._asset_browser.total_assets > 0:
+                self._sync_asset_browser_fields()
+                success = self._asset_browser.load_asset(0)
+                self._update_asset_browser_labels(success)
+
+        self._widgets["loc_status"].text = f"Created and selected: {name}"
+        carb.log_info(f"[BLV] Created location '{name}'")
+
+    def _on_delete_location(self) -> None:
+        """Delete the currently selected location."""
+        name = self._location_manager.current_location
+        if not name:
+            self._widgets["loc_status"].text = "No location selected to delete."
+            return
+
+        if self._location_manager.delete_location(name):
+            self._widgets["loc_status"].text = f"Deleted location: {name}"
+            self._refresh_location_list()
+            self._apply_project_paths()
+        else:
+            self._widgets["loc_status"].text = f"Failed to delete '{name}'"
 
     # ---- 1. Camera Controller ---------------------------------------- #
 
@@ -597,6 +809,13 @@ class DataCollectorWindow:
                         clicked_fn=self._on_cancel_record_with_trajectory,
                     )
 
+                with ui.HStack(height=_BUTTON_HEIGHT):
+                    ui.Button(
+                        "Record All Trajectories",
+                        clicked_fn=self._on_record_all_trajectories,
+                        tooltip="Record all trajectories at the current location for the loaded asset",
+                    )
+
                 self._widgets["rwt_progress"] = ui.ProgressBar(
                     height=_FIELD_HEIGHT
                 )
@@ -613,6 +832,42 @@ class DataCollectorWindow:
     def _build_asset_browser_section(self) -> None:
         with ui.CollapsableFrame("Asset Browser", height=0):
             with ui.VStack(spacing=_SPACING):
+
+                # ---- Location sub-section (top of Asset Browser) ---- #
+                with ui.HStack(height=_FIELD_HEIGHT):
+                    ui.Label("Location:", width=_LABEL_WIDTH)
+                    self._widgets["loc_combo"] = ui.ComboBox(0)
+                    self._widgets["loc_combo"].model.add_item_changed_fn(
+                        self._on_location_combo_changed
+                    )
+
+                with ui.HStack(height=_BUTTON_HEIGHT):
+                    ui.Button(
+                        "New Location",
+                        clicked_fn=self._on_new_location_clicked,
+                    )
+                    ui.Button(
+                        "Delete Location",
+                        clicked_fn=self._on_delete_location,
+                    )
+
+                # Inline new-location row (hidden by default)
+                self._widgets["loc_new_row"] = ui.HStack(
+                    height=_FIELD_HEIGHT, visible=False
+                )
+                with self._widgets["loc_new_row"]:
+                    ui.Label("Name:", width=60)
+                    self._widgets["loc_name_field"] = ui.StringField()
+                    ui.Button("Create", width=60, clicked_fn=self._on_create_location)
+                    ui.Button("Cancel", width=60, clicked_fn=self._on_cancel_new_location)
+
+                self._widgets["loc_status"] = ui.Label(
+                    "No location selected", height=_FIELD_HEIGHT
+                )
+
+                ui.Separator(height=4)
+
+                # ---- Asset Root & Transform ---- #
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Asset Root:", width=_LABEL_WIDTH)
                     self._widgets["ab_folder"] = ui.StringField()
@@ -671,6 +926,9 @@ class DataCollectorWindow:
         self._root_folder = self._widgets["root_folder"].model.get_value_as_string().strip()
         self._environment = self._widgets["environment"].model.get_value_as_string().strip()
         self._class_name = self._widgets["class_name"].model.get_value_as_string().strip()
+        # Clear location when project context changes — the new env/class
+        # combo may have completely different locations.
+        self._location_manager.current_location = ""
         self._apply_project_paths()
 
     def _on_apply_project_settings(self) -> None:
@@ -695,7 +953,7 @@ class DataCollectorWindow:
         # always in sync with the project settings.
         self._asset_browser.class_name = self._class_name
 
-        # Apply paths (resolves trajectory dir, refreshes trajectory list)
+        # Apply paths (resolves trajectory dir, refreshes trajectory/location lists)
         self._apply_project_paths()
 
         # Rescan the asset folder for the new class subfolder so the
@@ -703,6 +961,15 @@ class DataCollectorWindow:
         ab_root = self._widgets.get("ab_folder")
         if ab_root is not None and self._class_name:
             self._scan_asset_folder(ab_root.model.get_value_as_string().strip())
+
+        # If saved locations exist for this env+class, auto-select the first
+        # one and load the first asset with its saved transform.
+        locations = self._location_manager.list_locations()
+        if locations and not self._location_manager.has_location_selected:
+            first_loc = locations[0]
+            self._switch_to_location(first_loc)
+            # Update the ComboBox to reflect the selection
+            self._refresh_location_list()
 
         carb.log_info(
             f"[BLV] Project settings applied: root={self._root_folder}, "
@@ -1033,6 +1300,146 @@ class DataCollectorWindow:
         )
 
     # ================================================================= #
+    #  Callbacks — Record All Trajectories                                #
+    # ================================================================= #
+
+    def _on_record_all_trajectories(self) -> None:
+        """Launch an async workflow that records every trajectory at the
+        current location for the currently loaded asset."""
+        if self._record_traj_task is not None and not self._record_traj_task.done():
+            carb.log_warn("[BLV] A recording session is already running.")
+            self._widgets["rwt_status"].text = "Error: recording already in progress"
+            return
+
+        if not self._require_project_context("rwt_status"):
+            return
+
+        if not self._location_manager.has_location_selected:
+            self._widgets["rwt_status"].text = (
+                "Error: select a location first (Location section)."
+            )
+            return
+
+        traj_names = self._traj_manager.list_trajectory_names()
+        if not traj_names:
+            self._widgets["rwt_status"].text = (
+                "Error: no trajectories recorded for this location yet."
+            )
+            return
+
+        w = self._widgets["res_w"].model.get_value_as_int()
+        h = self._widgets["res_h"].model.get_value_as_int()
+        rt = self._widgets["rt_subframes"].model.get_value_as_int()
+
+        self._record_traj_task = asyncio.ensure_future(
+            self._record_all_trajectories_async(traj_names, (w, h), rt)
+        )
+
+    async def _record_all_trajectories_async(
+        self,
+        traj_names: list,
+        resolution: tuple,
+        rt_subframes: int,
+    ) -> None:
+        """Record all trajectories in the current location for the loaded asset.
+
+        Fully automatic: sets up writer, iterates trajectories, captures
+        frames, reinitializes writer between trajectories, and tears down
+        the writer at the end.
+        """
+        import json
+
+        total_trajs = len(traj_names)
+        frame_step = max(1, self._widgets["rwt_frame_step"].model.get_value_as_int())
+        recorder = self._data_recorder
+        cls = self._current_class_name()
+
+        overall_captured = 0
+
+        try:
+            for traj_idx, traj_name in enumerate(traj_names):
+                traj_stem = os.path.splitext(traj_name)[0]
+                traj_path = os.path.join(self._traj_manager.directory, traj_name)
+                output_dir = self._get_capture_output_dir(
+                    class_name=cls, traj_name=traj_stem,
+                )
+
+                self._widgets["rwt_status"].text = (
+                    f"Trajectory {traj_idx + 1}/{total_trajs}: {traj_stem} — loading..."
+                )
+
+                try:
+                    with open(traj_path, "r") as fh:
+                        trajectory = json.load(fh)
+                except Exception as exc:
+                    carb.log_error(
+                        f"[BLV] Record-all: failed to load {traj_path}: {exc}"
+                    )
+                    continue
+
+                frames = trajectory.get("frames", [])
+                if not frames:
+                    carb.log_warn(
+                        f"[BLV] Record-all: trajectory {traj_name} has 0 frames, skipping."
+                    )
+                    continue
+
+                # Setup or reinitialize writer
+                if not recorder.is_setup:
+                    recorder.camera_path = self._camera_ctrl.camera_path
+                    recorder.resolution = resolution
+                    recorder.annotators = self._annotator_cfg
+                    recorder.setup(output_dir, rt_subframes=rt_subframes)
+                else:
+                    recorder.reinitialize_writer(output_dir)
+
+                sampled_indices = list(range(0, len(frames), frame_step))
+                n_captures = len(sampled_indices)
+
+                for capture_idx, frame_idx in enumerate(sampled_indices):
+                    frame_data = frames[frame_idx]
+                    self._camera_ctrl.set_pose(
+                        frame_data["position"], frame_data["rotation"]
+                    )
+                    await omni.kit.app.get_app().next_update_async()
+                    await recorder.capture_frame()
+
+                    # Progress: combine trajectory-level and frame-level
+                    traj_progress = traj_idx / total_trajs
+                    frame_progress = (capture_idx + 1) / n_captures / total_trajs
+                    self._widgets["rwt_progress"].model.set_value(
+                        traj_progress + frame_progress
+                    )
+                    self._widgets["rwt_status"].text = (
+                        f"Trajectory {traj_idx + 1}/{total_trajs}: {traj_stem} — "
+                        f"frame {capture_idx + 1}/{n_captures}"
+                    )
+
+                overall_captured += n_captures
+                carb.log_info(
+                    f"[BLV] Record-all: {traj_stem} done ({n_captures} frames → {output_dir})"
+                )
+
+        except asyncio.CancelledError:
+            carb.log_info("[BLV] Record-all was cancelled.")
+            self._widgets["rwt_status"].text = "Cancelled"
+        except Exception as exc:
+            carb.log_error(f"[BLV] Record-all error: {exc}")
+            self._widgets["rwt_status"].text = f"Error: {exc}"
+        finally:
+            # Full teardown after batch — the session is complete
+            recorder.teardown()
+            self._default_run_name = None
+
+        self._widgets["rwt_progress"].model.set_value(1.0)
+        self._widgets["rwt_status"].text = (
+            f"Done — {overall_captured} frames across {total_trajs} trajectories"
+        )
+        carb.log_info(
+            f"[BLV] Record-all complete — {overall_captured} total frames"
+        )
+
+    # ================================================================= #
     #  Callbacks — Asset Browser                                          #
     # ================================================================= #
 
@@ -1055,7 +1462,7 @@ class DataCollectorWindow:
         cls = self._current_class_name()
 
         # Normalize the root, then compose the actual scan folder
-        root_folder = os.path.normpath(os.path.expanduser(root_folder))
+        root_folder = self._normalize_path(root_folder)
         if not cls:
             carb.log_warn("[BLV] Class Name is empty — cannot scan assets.")
             self._widgets["ab_status"].text = "Error: set Class Name first"
@@ -1110,28 +1517,65 @@ class DataCollectorWindow:
         cls = self._current_class_name()
         if not root or not cls:
             return ""
-        return os.path.normpath(os.path.join(os.path.expanduser(root), cls))
+        return os.path.join(self._normalize_path(root), cls)
+
+    def _auto_save_location_transform(self) -> None:
+        """If a location is active, persist the current transform.
+
+        Reads the live prim xformOps first (most accurate).  Falls back
+        to the asset browser's stored spawn transform when no prim is
+        loaded — this covers the "From Selection" case where the captured
+        transform hasn't been applied to a prim yet.
+        """
+        if not self._location_manager.has_location_selected:
+            return
+        xform = self._asset_browser.read_current_prim_transform()
+        if xform is not None:
+            t, o, s = xform
+        else:
+            # Fall back to the browser's stored spawn values
+            t = self._asset_browser.spawn_translate
+            o = self._asset_browser.spawn_orient
+            s = self._asset_browser.spawn_scale
+        try:
+            self._location_manager.save_transform(
+                self._location_manager.current_location,
+                translate=[t[0], t[1], t[2]],
+                orient=[
+                    o.GetReal(),
+                    o.GetImaginary()[0],
+                    o.GetImaginary()[1],
+                    o.GetImaginary()[2],
+                ],
+                scale=[s[0], s[1], s[2]],
+            )
+        except Exception as exc:
+            carb.log_warn(f"[BLV] Auto-save location transform failed: {exc}")
+
+    def _navigate_asset(self, direction: str) -> None:
+        """Navigate to the next or previous asset in the browser.
+
+        Handles auto-saving the location transform, auto-scanning when
+        the asset root/class has changed, and updating UI labels.
+        """
+        self._auto_save_location_transform()
+
+        root = self._widgets["ab_folder"].model.get_value_as_string().strip()
+        if self._expected_scan_folder() != self._asset_browser.asset_folder:
+            self._scan_asset_folder(root)
+
+        self._sync_asset_browser_fields()
+        if direction == "next":
+            success = self._asset_browser.next_asset()
+        else:
+            success = self._asset_browser.previous_asset()
+        self._update_asset_browser_labels(success)
 
     def _on_next_asset(self) -> None:
-        carb.log_warn("[BLV] Next button clicked")
-        # Auto-scan if root or class changed since the last scan
-        root = self._widgets["ab_folder"].model.get_value_as_string().strip()
-        if self._expected_scan_folder() != self._asset_browser.asset_folder:
-            self._scan_asset_folder(root)
-
-        self._sync_asset_browser_fields()
-        success = self._asset_browser.next_asset()
-        self._update_asset_browser_labels(success)
+        self._navigate_asset("next")
 
     def _on_prev_asset(self) -> None:
-        carb.log_warn("[BLV] Prev button clicked")
-        root = self._widgets["ab_folder"].model.get_value_as_string().strip()
-        if self._expected_scan_folder() != self._asset_browser.asset_folder:
-            self._scan_asset_folder(root)
-
-        self._sync_asset_browser_fields()
-        success = self._asset_browser.previous_asset()
-        self._update_asset_browser_labels(success)
+        self._navigate_asset("prev")
 
     def _on_capture_spawn_transform(self) -> None:
         """Capture the selected prim's world transform as the spawn position."""
@@ -1146,6 +1590,8 @@ class DataCollectorWindow:
             return
         if self._asset_browser.capture_transform_from_prim(sel[0]):
             self._update_spawn_transform_fields()
+            # Persist to the active location immediately
+            self._auto_save_location_transform()
             self._widgets["ab_status"].text = f"Transform captured from {sel[0]}"
         else:
             self._widgets["ab_status"].text = "Failed to capture transform"
