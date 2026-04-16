@@ -79,6 +79,8 @@ _LABEL_WIDTH = 130
 _FIELD_HEIGHT = 22
 _BUTTON_HEIGHT = 28
 _SPACING = 6
+_WARMUP_FRAMES = 10   # render frames to wait after loading a new USD asset
+_SCENE_WARMUP_FRAMES = 30  # render frames to wait after loading a new USD scene
 
 
 class DataCollectorWindow:
@@ -141,6 +143,7 @@ class DataCollectorWindow:
             cfg.get("asset_root_folder")
             or cfg.get("asset_folder", "")
         )
+        default_envs_folder = cfg.get("environments_folder", "")
         default_parent_prim = cfg.get("parent_prim_path", "/World")
 
         # Annotator settings from YAML (merged over built-in defaults)
@@ -180,6 +183,7 @@ class DataCollectorWindow:
         # Asset browser defaults from config
         self._default_asset_root: str = default_asset_root
         self._default_focal_length: float = default_focal
+        self._default_envs_folder: str = default_envs_folder
 
         # Cached ``default_N`` folder name used when no asset is loaded.
         # Allocated lazily on first capture in a session and reset on
@@ -217,6 +221,7 @@ class DataCollectorWindow:
                     self._build_data_capture_section()
                     self._build_record_with_trajectory_section()
                     self._build_asset_browser_section()
+                    self._build_brainrot_section()
 
         # Apply initial project paths
         self._apply_project_paths()
@@ -800,20 +805,20 @@ class DataCollectorWindow:
                     ui.Label(" frames  (1 = every frame)", width=180)
 
                 with ui.HStack(height=_BUTTON_HEIGHT):
-                    ui.Button(
+                    self._widgets["rwt_record_btn"] = ui.Button(
                         "Record Trajectory",
                         clicked_fn=self._on_record_with_trajectory,
                     )
-                    ui.Button(
+                    self._widgets["rwt_cancel_btn"] = ui.Button(
                         "Cancel",
                         clicked_fn=self._on_cancel_record_with_trajectory,
                     )
 
                 with ui.HStack(height=_BUTTON_HEIGHT):
-                    ui.Button(
+                    self._widgets["rwt_record_all_btn"] = ui.Button(
                         "Record All Trajectories",
                         clicked_fn=self._on_record_all_trajectories,
-                        tooltip="Record all trajectories at the current location for the loaded asset",
+                        tooltip="Record all trajectories at the current location for ALL assets",
                     )
 
                 self._widgets["rwt_progress"] = ui.ProgressBar(
@@ -915,6 +920,42 @@ class DataCollectorWindow:
                 )
                 self._widgets["ab_current"] = ui.Label(
                     "Current: None", height=_FIELD_HEIGHT
+                )
+
+    # ---- 7. Brainrot Mode --------------------------------------------- #
+
+    def _build_brainrot_section(self) -> None:
+        with ui.CollapsableFrame("Brainrot Mode", height=0, collapsed=True):
+            with ui.VStack(spacing=_SPACING):
+                ui.Label(
+                    "Iterate ALL environments x ALL locations x ALL assets "
+                    "x ALL trajectories and record captures for every "
+                    "combination. Loads each environment USD scene "
+                    "automatically.",
+                    height=_FIELD_HEIGHT * 3,
+                    word_wrap=True,
+                )
+                with ui.HStack(height=_FIELD_HEIGHT):
+                    ui.Label("Environments Folder:", width=_LABEL_WIDTH)
+                    self._widgets["brainrot_envs_folder"] = ui.StringField()
+                    self._widgets["brainrot_envs_folder"].model.set_value(
+                        self._default_envs_folder
+                    )
+                with ui.HStack(height=_BUTTON_HEIGHT):
+                    self._widgets["brainrot_start_btn"] = ui.Button(
+                        "Start Brainrot",
+                        clicked_fn=self._on_brainrot_start,
+                    )
+                    self._widgets["brainrot_cancel_btn"] = ui.Button(
+                        "Cancel",
+                        clicked_fn=self._on_brainrot_cancel,
+                    )
+                self._widgets["brainrot_progress"] = ui.ProgressBar(
+                    height=_FIELD_HEIGHT
+                )
+                self._widgets["brainrot_progress"].model.set_value(0.0)
+                self._widgets["brainrot_status"] = ui.Label(
+                    "Idle", height=_FIELD_HEIGHT, word_wrap=True
                 )
 
     # ================================================================= #
@@ -1305,7 +1346,7 @@ class DataCollectorWindow:
 
     def _on_record_all_trajectories(self) -> None:
         """Launch an async workflow that records every trajectory at the
-        current location for the currently loaded asset."""
+        current location for ALL assets in the asset folder."""
         if self._record_traj_task is not None and not self._record_traj_task.done():
             carb.log_warn("[BLV] A recording session is already running.")
             self._widgets["rwt_status"].text = "Error: recording already in progress"
@@ -1317,6 +1358,13 @@ class DataCollectorWindow:
         if not self._location_manager.has_location_selected:
             self._widgets["rwt_status"].text = (
                 "Error: select a location first (Location section)."
+            )
+            return
+
+        total_assets = self._asset_browser.total_assets
+        if total_assets < 1:
+            self._widgets["rwt_status"].text = (
+                "Error: no assets scanned. Set asset root folder and class name first."
             )
             return
 
@@ -1332,93 +1380,121 @@ class DataCollectorWindow:
         rt = self._widgets["rt_subframes"].model.get_value_as_int()
 
         self._record_traj_task = asyncio.ensure_future(
-            self._record_all_trajectories_async(traj_names, (w, h), rt)
+            self._record_all_trajectories_async(
+                traj_names, total_assets, (w, h), rt
+            )
         )
 
     async def _record_all_trajectories_async(
         self,
         traj_names: list,
+        total_assets: int,
         resolution: tuple,
         rt_subframes: int,
     ) -> None:
-        """Record all trajectories in the current location for the loaded asset.
+        """Record all trajectories for ALL assets at the current location.
 
-        Fully automatic: sets up writer, iterates trajectories, captures
-        frames, reinitializes writer between trajectories, and tears down
-        the writer at the end.
+        Outer loop iterates assets, inner loop iterates trajectories.
+        After loading each asset, waits ``_WARMUP_FRAMES`` render frames
+        for the renderer to settle before capturing.
         """
         import json
 
         total_trajs = len(traj_names)
+        total_units = total_assets * total_trajs
         frame_step = max(1, self._widgets["rwt_frame_step"].model.get_value_as_int())
         recorder = self._data_recorder
         cls = self._current_class_name()
 
         overall_captured = 0
+        completed_units = 0
+
+        self._set_recording_buttons_enabled(False)
+        if "rwt_cancel_btn" in self._widgets:
+            self._widgets["rwt_cancel_btn"].enabled = True
 
         try:
-            for traj_idx, traj_name in enumerate(traj_names):
-                traj_stem = os.path.splitext(traj_name)[0]
-                traj_path = os.path.join(self._traj_manager.directory, traj_name)
-                output_dir = self._get_capture_output_dir(
-                    class_name=cls, traj_name=traj_stem,
-                )
+            for asset_idx in range(total_assets):
+                # Load asset at current location's spawn transform
+                self._asset_browser.load_asset(asset_idx, preserve_transform=False)
+                self._update_asset_browser_labels(True)
+                asset_stem = self._asset_browser.current_asset_stem
 
                 self._widgets["rwt_status"].text = (
-                    f"Trajectory {traj_idx + 1}/{total_trajs}: {traj_stem} — loading..."
+                    f"Asset {asset_idx + 1}/{total_assets}: {asset_stem} — warming up..."
                 )
 
-                try:
-                    with open(traj_path, "r") as fh:
-                        trajectory = json.load(fh)
-                except Exception as exc:
-                    carb.log_error(
-                        f"[BLV] Record-all: failed to load {traj_path}: {exc}"
-                    )
-                    continue
-
-                frames = trajectory.get("frames", [])
-                if not frames:
-                    carb.log_warn(
-                        f"[BLV] Record-all: trajectory {traj_name} has 0 frames, skipping."
-                    )
-                    continue
-
-                # Setup or reinitialize writer
-                if not recorder.is_setup:
-                    recorder.camera_path = self._camera_ctrl.camera_path
-                    recorder.resolution = resolution
-                    recorder.annotators = self._annotator_cfg
-                    recorder.setup(output_dir, rt_subframes=rt_subframes)
-                else:
-                    recorder.reinitialize_writer(output_dir)
-
-                sampled_indices = list(range(0, len(frames), frame_step))
-                n_captures = len(sampled_indices)
-
-                for capture_idx, frame_idx in enumerate(sampled_indices):
-                    frame_data = frames[frame_idx]
-                    self._camera_ctrl.set_pose(
-                        frame_data["position"], frame_data["rotation"]
-                    )
+                # Wait for renderer to settle after asset swap
+                for _ in range(_WARMUP_FRAMES):
                     await omni.kit.app.get_app().next_update_async()
-                    await recorder.capture_frame()
 
-                    # Progress: combine trajectory-level and frame-level
-                    traj_progress = traj_idx / total_trajs
-                    frame_progress = (capture_idx + 1) / n_captures / total_trajs
-                    self._widgets["rwt_progress"].model.set_value(
-                        traj_progress + frame_progress
+                for traj_idx, traj_name in enumerate(traj_names):
+                    traj_stem = os.path.splitext(traj_name)[0]
+                    traj_path = os.path.join(self._traj_manager.directory, traj_name)
+                    output_dir = self._get_capture_output_dir(
+                        class_name=cls, traj_name=traj_stem,
                     )
+
                     self._widgets["rwt_status"].text = (
-                        f"Trajectory {traj_idx + 1}/{total_trajs}: {traj_stem} — "
-                        f"frame {capture_idx + 1}/{n_captures}"
+                        f"Asset {asset_idx + 1}/{total_assets}: {asset_stem} | "
+                        f"Traj {traj_idx + 1}/{total_trajs}: {traj_stem} — loading..."
                     )
 
-                overall_captured += n_captures
-                carb.log_info(
-                    f"[BLV] Record-all: {traj_stem} done ({n_captures} frames → {output_dir})"
-                )
+                    try:
+                        with open(traj_path, "r") as fh:
+                            trajectory = json.load(fh)
+                    except Exception as exc:
+                        carb.log_error(
+                            f"[BLV] Record-all: failed to load {traj_path}: {exc}"
+                        )
+                        completed_units += 1
+                        continue
+
+                    frames = trajectory.get("frames", [])
+                    if not frames:
+                        carb.log_warn(
+                            f"[BLV] Record-all: trajectory {traj_name} has 0 frames, skipping."
+                        )
+                        completed_units += 1
+                        continue
+
+                    # Setup or reinitialize writer
+                    if not recorder.is_setup:
+                        recorder.camera_path = self._camera_ctrl.camera_path
+                        recorder.resolution = resolution
+                        recorder.annotators = self._annotator_cfg
+                        recorder.setup(output_dir, rt_subframes=rt_subframes)
+                    else:
+                        recorder.reinitialize_writer(output_dir)
+
+                    sampled_indices = list(range(0, len(frames), frame_step))
+                    n_captures = len(sampled_indices)
+
+                    for capture_idx, frame_idx in enumerate(sampled_indices):
+                        frame_data = frames[frame_idx]
+                        self._camera_ctrl.set_pose(
+                            frame_data["position"], frame_data["rotation"]
+                        )
+                        await omni.kit.app.get_app().next_update_async()
+                        await recorder.capture_frame()
+
+                        # Progress: unit-level + frame-level sub-progress
+                        frac = (
+                            completed_units + (capture_idx + 1) / n_captures
+                        ) / total_units
+                        self._widgets["rwt_progress"].model.set_value(frac)
+                        self._widgets["rwt_status"].text = (
+                            f"Asset {asset_idx + 1}/{total_assets}: {asset_stem} | "
+                            f"Traj {traj_idx + 1}/{total_trajs}: {traj_stem} | "
+                            f"Frame {capture_idx + 1}/{n_captures}"
+                        )
+
+                    overall_captured += n_captures
+                    completed_units += 1
+                    carb.log_info(
+                        f"[BLV] Record-all: {asset_stem}/{traj_stem} done "
+                        f"({n_captures} frames -> {output_dir})"
+                    )
 
         except asyncio.CancelledError:
             carb.log_info("[BLV] Record-all was cancelled.")
@@ -1427,16 +1503,361 @@ class DataCollectorWindow:
             carb.log_error(f"[BLV] Record-all error: {exc}")
             self._widgets["rwt_status"].text = f"Error: {exc}"
         finally:
-            # Full teardown after batch — the session is complete
             recorder.teardown()
             self._default_run_name = None
+            self._set_recording_buttons_enabled(True)
 
         self._widgets["rwt_progress"].model.set_value(1.0)
         self._widgets["rwt_status"].text = (
-            f"Done — {overall_captured} frames across {total_trajs} trajectories"
+            f"Done — {overall_captured} frames across "
+            f"{total_assets} assets x {total_trajs} trajectories"
         )
         carb.log_info(
             f"[BLV] Record-all complete — {overall_captured} total frames"
+        )
+
+    # ================================================================= #
+    #  Callbacks — Brainrot Mode                                          #
+    # ================================================================= #
+
+    def _on_brainrot_start(self) -> None:
+        """Launch the brainrot workflow: all envs x locations x assets x trajectories."""
+        if self._record_traj_task is not None and not self._record_traj_task.done():
+            self._widgets["brainrot_status"].text = "Error: recording already in progress"
+            return
+
+        cls = self._current_class_name()
+        if not cls:
+            self._widgets["brainrot_status"].text = (
+                "Error: Class Name required — set in Project Settings."
+            )
+            return
+
+        total_assets = self._asset_browser.total_assets
+        if total_assets < 1:
+            self._widgets["brainrot_status"].text = (
+                "Error: no assets scanned. Set asset root folder and class name first."
+            )
+            return
+
+        envs_folder = self._normalize_path(
+            self._widgets["brainrot_envs_folder"].model.get_value_as_string().strip()
+        )
+        if not envs_folder or not os.path.isdir(envs_folder):
+            self._widgets["brainrot_status"].text = (
+                "Error: environments folder not found."
+            )
+            return
+
+        root = self._normalize_path(self._root_folder)
+
+        # Pre-scan: find environments with a USD scene AND locations with trajectories
+        env_plan = []  # list of (env_name, usd_path, {loc: [traj_files]})
+        for env_name in sorted(os.listdir(envs_folder)):
+            usd_path = os.path.join(envs_folder, env_name, f"{env_name}.usd")
+            if not os.path.isfile(usd_path):
+                continue
+
+            data_dir = os.path.join(root, cls, env_name)
+            if not os.path.isdir(data_dir):
+                continue
+
+            # Find locations with location.json AND trajectories
+            loc_traj_map = {}
+            for loc_name in sorted(os.listdir(data_dir)):
+                loc_dir = os.path.join(data_dir, loc_name)
+                if not os.path.isdir(loc_dir):
+                    continue
+                loc_json = os.path.join(loc_dir, "location.json")
+                traj_dir = os.path.join(loc_dir, "trajectories")
+                if os.path.isfile(loc_json) and os.path.isdir(traj_dir):
+                    traj_files = sorted(
+                        f for f in os.listdir(traj_dir)
+                        if f.endswith(".json")
+                    )
+                    if traj_files:
+                        loc_traj_map[loc_name] = traj_files
+
+            if loc_traj_map:
+                env_plan.append((env_name, usd_path, loc_traj_map))
+
+        if not env_plan:
+            self._widgets["brainrot_status"].text = (
+                "Error: no environments found with locations and trajectories "
+                f"for class '{cls}'."
+            )
+            return
+
+        total_locs = sum(len(e[2]) for e in env_plan)
+        total_trajs = sum(
+            len(trajs)
+            for _, _, locs in env_plan
+            for trajs in locs.values()
+        )
+        self._widgets["brainrot_status"].text = (
+            f"Starting: {len(env_plan)} envs, {total_locs} locations, "
+            f"{total_assets} assets, {total_trajs} trajectories"
+        )
+
+        w = self._widgets["res_w"].model.get_value_as_int()
+        h = self._widgets["res_h"].model.get_value_as_int()
+        rt = self._widgets["rt_subframes"].model.get_value_as_int()
+
+        self._record_traj_task = asyncio.ensure_future(
+            self._brainrot_async(env_plan, (w, h), rt)
+        )
+
+    def _on_brainrot_cancel(self) -> None:
+        """Cancel a running brainrot session."""
+        if self._record_traj_task is not None and not self._record_traj_task.done():
+            self._record_traj_task.cancel()
+            self._widgets["brainrot_status"].text = "Cancelling..."
+
+    async def _brainrot_async(
+        self,
+        env_plan: list,
+        resolution: tuple,
+        rt_subframes: int,
+    ) -> None:
+        """Record ALL environments x locations x assets x trajectories.
+
+        Loop order: Environment -> Location -> Asset -> Trajectory.
+        Each environment loads a new USD scene. The recorder is torn
+        down between environments because the render product (tied to
+        the camera prim) becomes invalid when the stage changes.
+        """
+        import json
+
+        frame_step = max(1, self._widgets["rwt_frame_step"].model.get_value_as_int())
+        recorder = self._data_recorder
+        cls = self._current_class_name()
+        root = self._normalize_path(self._root_folder)
+        total_assets = self._asset_browser.total_assets
+        total_envs = len(env_plan)
+
+        # Save original state for restoration
+        original_env = self._current_environment()
+        original_location = self._location_manager.current_location
+
+        # Pre-compute total work units for smooth progress
+        # Each unit = one (env, location, asset, trajectory) combo
+        total_units = sum(
+            total_assets * len(trajs)
+            for _, _, loc_map in env_plan
+            for trajs in loc_map.values()
+        )
+
+        overall_captured = 0
+        completed_units = 0
+
+        self._set_recording_buttons_enabled(False)
+        if "brainrot_cancel_btn" in self._widgets:
+            self._widgets["brainrot_cancel_btn"].enabled = True
+
+        try:
+            for env_idx, (env_name, usd_path, loc_traj_map) in enumerate(
+                env_plan
+            ):
+                total_locs = len(loc_traj_map)
+
+                # -- Load the USD scene for this environment --
+                self._widgets["brainrot_status"].text = (
+                    f"Env {env_idx + 1}/{total_envs}: {env_name} "
+                    f"— loading scene..."
+                )
+                carb.log_info(
+                    f"[BLV] Brainrot: loading scene {usd_path}"
+                )
+
+                # Teardown recorder before stage change (render product
+                # references the old camera prim which will be destroyed)
+                if recorder.is_setup:
+                    recorder.teardown()
+
+                usd_context = omni.usd.get_context()
+                success, error = await usd_context.open_stage_async(usd_path)
+                if not success:
+                    carb.log_error(
+                        f"[BLV] Brainrot: failed to load scene "
+                        f"{usd_path}: {error}"
+                    )
+                    # Skip all units for this environment
+                    for trajs in loc_traj_map.values():
+                        completed_units += total_assets * len(trajs)
+                    continue
+
+                # Wait for scene to settle
+                for _ in range(_SCENE_WARMUP_FRAMES):
+                    await omni.kit.app.get_app().next_update_async()
+
+                # Ensure camera prim exists in the new scene
+                self._camera_ctrl._ensure_camera_prim()
+
+                # Update environment in UI and project paths
+                self._widgets["environment"].model.set_value(env_name)
+                self._environment = env_name
+                self._location_manager.set_base_directory(root, cls, env_name)
+
+                for loc_idx, (loc_name, traj_names) in enumerate(
+                    loc_traj_map.items()
+                ):
+                    total_trajs = len(traj_names)
+
+                    # Switch to this location
+                    self._switch_to_location(loc_name)
+                    self._refresh_location_list()
+
+                    self._widgets["brainrot_status"].text = (
+                        f"Env {env_idx + 1}/{total_envs}: {env_name} | "
+                        f"Loc {loc_idx + 1}/{total_locs}: {loc_name}"
+                    )
+
+                    for asset_idx in range(total_assets):
+                        # Load asset at this location's spawn transform
+                        self._asset_browser.load_asset(
+                            asset_idx, preserve_transform=False
+                        )
+                        self._update_asset_browser_labels(True)
+                        asset_stem = self._asset_browser.current_asset_stem
+
+                        self._widgets["brainrot_status"].text = (
+                            f"Env {env_idx + 1}/{total_envs}: {env_name} | "
+                            f"Loc {loc_idx + 1}/{total_locs}: {loc_name} | "
+                            f"Asset {asset_idx + 1}/{total_assets}: "
+                            f"{asset_stem} — warming up..."
+                        )
+
+                        # Wait for renderer to settle after asset swap
+                        for _ in range(_WARMUP_FRAMES):
+                            await omni.kit.app.get_app().next_update_async()
+
+                        for traj_idx, traj_name in enumerate(traj_names):
+                            traj_stem = os.path.splitext(traj_name)[0]
+                            traj_path = os.path.join(
+                                self._traj_manager.directory, traj_name
+                            )
+                            output_dir = self._get_capture_output_dir(
+                                class_name=cls, traj_name=traj_stem,
+                            )
+
+                            # Load trajectory
+                            try:
+                                with open(traj_path, "r") as fh:
+                                    trajectory = json.load(fh)
+                            except Exception as exc:
+                                carb.log_error(
+                                    f"[BLV] Brainrot: failed to load "
+                                    f"{traj_path}: {exc}"
+                                )
+                                completed_units += 1
+                                continue
+
+                            frames = trajectory.get("frames", [])
+                            if not frames:
+                                carb.log_warn(
+                                    f"[BLV] Brainrot: {traj_name} "
+                                    f"has 0 frames, skipping."
+                                )
+                                completed_units += 1
+                                continue
+
+                            # Setup or reinitialize writer
+                            if not recorder.is_setup:
+                                recorder.camera_path = (
+                                    self._camera_ctrl.camera_path
+                                )
+                                recorder.resolution = resolution
+                                recorder.annotators = self._annotator_cfg
+                                recorder.setup(
+                                    output_dir,
+                                    rt_subframes=rt_subframes,
+                                )
+                            else:
+                                recorder.reinitialize_writer(output_dir)
+
+                            sampled_indices = list(
+                                range(0, len(frames), frame_step)
+                            )
+                            n_captures = len(sampled_indices)
+
+                            for capture_idx, frame_idx in enumerate(
+                                sampled_indices
+                            ):
+                                frame_data = frames[frame_idx]
+                                self._camera_ctrl.set_pose(
+                                    frame_data["position"],
+                                    frame_data["rotation"],
+                                )
+                                await (
+                                    omni.kit.app.get_app().next_update_async()
+                                )
+                                await recorder.capture_frame()
+
+                                # Progress
+                                frac = (
+                                    completed_units
+                                    + (capture_idx + 1) / n_captures
+                                ) / total_units
+                                self._widgets[
+                                    "brainrot_progress"
+                                ].model.set_value(frac)
+                                self._widgets["brainrot_status"].text = (
+                                    f"Env {env_idx + 1}/{total_envs}: "
+                                    f"{env_name} | "
+                                    f"Loc {loc_idx + 1}/{total_locs}: "
+                                    f"{loc_name} | "
+                                    f"Asset {asset_idx + 1}/{total_assets}"
+                                    f": {asset_stem} | "
+                                    f"Traj {traj_idx + 1}/{total_trajs}: "
+                                    f"{traj_stem} | "
+                                    f"Frame {capture_idx + 1}/{n_captures}"
+                                )
+
+                            overall_captured += n_captures
+                            completed_units += 1
+                            carb.log_info(
+                                f"[BLV] Brainrot: {env_name}/{loc_name}/"
+                                f"{asset_stem}/{traj_stem} done "
+                                f"({n_captures} frames -> {output_dir})"
+                            )
+
+                # Teardown recorder at end of this environment (render
+                # product will be invalid after next scene load)
+                if recorder.is_setup:
+                    recorder.teardown()
+
+        except asyncio.CancelledError:
+            carb.log_info("[BLV] Brainrot mode was cancelled.")
+            self._widgets["brainrot_status"].text = "Cancelled"
+        except Exception as exc:
+            carb.log_error(f"[BLV] Brainrot error: {exc}")
+            self._widgets["brainrot_status"].text = f"Error: {exc}"
+        finally:
+            if recorder.is_setup:
+                recorder.teardown()
+            self._default_run_name = None
+            self._set_recording_buttons_enabled(True)
+
+            # Restore original environment and location
+            if original_env:
+                self._widgets["environment"].model.set_value(original_env)
+                self._environment = original_env
+            if original_location:
+                try:
+                    self._apply_project_paths()
+                    self._switch_to_location(original_location)
+                    self._refresh_location_list()
+                except Exception:
+                    pass
+
+        self._widgets["brainrot_progress"].model.set_value(1.0)
+        self._widgets["brainrot_status"].text = (
+            f"Done — {overall_captured} frames across "
+            f"{total_envs} environments, {total_assets} assets"
+        )
+        carb.log_info(
+            f"[BLV] Brainrot complete — {overall_captured} total frames "
+            f"across {total_envs} environments"
         )
 
     # ================================================================= #
@@ -1510,6 +1931,18 @@ class DataCollectorWindow:
             carb.log_warn(f"[BLV] {msg}")
             return False
         return True
+
+    def _set_recording_buttons_enabled(self, enabled: bool) -> None:
+        """Enable or disable recording-related buttons to prevent conflicts."""
+        for key in (
+            "rwt_record_btn",
+            "rwt_cancel_btn",
+            "rwt_record_all_btn",
+            "brainrot_start_btn",
+            "brainrot_cancel_btn",
+        ):
+            if key in self._widgets:
+                self._widgets[key].enabled = enabled
 
     def _expected_scan_folder(self) -> str:
         """Compose the expected scan folder from the UI root + class fields."""
