@@ -80,7 +80,7 @@ _FIELD_HEIGHT = 22
 _BUTTON_HEIGHT = 28
 _SPACING = 6
 _WARMUP_FRAMES = 10   # render frames to wait after loading a new USD asset
-_SCENE_WARMUP_FRAMES = 30  # render frames to wait after loading a new USD scene
+_SCENE_WARMUP_FRAMES = 300  # render frames to wait after loading a new USD scene
 
 
 class DataCollectorWindow:
@@ -185,6 +185,15 @@ class DataCollectorWindow:
         self._default_focal_length: float = default_focal
         self._default_envs_folder: str = default_envs_folder
 
+        # Cached picker lists — populated once by _refresh_*_combo(),
+        # used by _current_environment() / _current_class_name() to
+        # resolve combo index → name without re-scanning the filesystem.
+        self._env_names: list = []
+        self._class_names: list = []
+
+        # Guard flag to suppress _on_project_setting_changed during init
+        self._initializing: bool = True
+
         # Cached ``default_N`` folder name used when no asset is loaded.
         # Allocated lazily on first capture in a session and reset on
         # writer teardown so the next session picks a fresh number.
@@ -198,6 +207,9 @@ class DataCollectorWindow:
 
         # Per-frame UI status updater
         self._status_update_sub = None
+
+        # Guard: suppresses per-frame USD prim access during stage transitions
+        self._stage_changing: bool = False
 
         # ---- Build UI ------------------------------------------------ #
         self._window = ui.Window(
@@ -222,6 +234,18 @@ class DataCollectorWindow:
                     self._build_record_with_trajectory_section()
                     self._build_asset_browser_section()
                     self._build_brainrot_section()
+
+        # Populate environment and class name pickers from disk.
+        # Done while _initializing=True so callbacks are suppressed.
+        self._refresh_environment_combo()
+        self._refresh_class_name_combo()
+
+        # Sync stored state from the now-populated combos
+        self._environment = self._current_environment()
+        self._class_name = self._current_class_name()
+
+        # Initialization complete — enable callbacks
+        self._initializing = False
 
         # Apply initial project paths
         self._apply_project_paths()
@@ -263,7 +287,7 @@ class DataCollectorWindow:
         """
         root = self._normalize_path(self._root_folder)
         env = self._environment
-        cls = self._current_class_name()
+        cls = self._class_name
         loc = self._location_manager.current_location
 
         # Keep the location manager's base directory in sync
@@ -378,6 +402,57 @@ class DataCollectorWindow:
         for item in items:
             model.append_child_item(None, ui.SimpleStringModel(item))
 
+    def _get_combo_selected_string(self, combo_key: str, items: list) -> str:
+        """Return the currently selected string from a ComboBox, or '' if invalid."""
+        combo = self._widgets.get(combo_key)
+        if combo is None:
+            return ""
+        current_item = combo.model.get_item_value_model()
+        if current_item is None:
+            return ""
+        idx = current_item.get_value_as_int()
+        if 0 <= idx < len(items):
+            return items[idx]
+        return ""
+
+    def _scan_environment_names(self) -> list:
+        """List subdirectory names inside the environments folder."""
+        folder = self._normalize_path(self._default_envs_folder)
+        if not folder or not os.path.isdir(folder):
+            return []
+        return sorted(
+            d for d in os.listdir(folder)
+            if os.path.isdir(os.path.join(folder, d))
+        )
+
+    def _scan_class_names(self) -> list:
+        """List subdirectory names inside the asset root folder."""
+        folder = self._normalize_path(self._default_asset_root)
+        if not folder or not os.path.isdir(folder):
+            return []
+        return sorted(
+            d for d in os.listdir(folder)
+            if os.path.isdir(os.path.join(folder, d))
+        )
+
+    def _refresh_environment_combo(self) -> None:
+        """Repopulate the environment ComboBox from disk and update cache."""
+        self._env_names = self._scan_environment_names()
+        self._repopulate_combo("environment", self._env_names)
+        # Re-select previously chosen environment if it still exists
+        if self._environment and self._environment in self._env_names:
+            idx = self._env_names.index(self._environment)
+            self._widgets["environment"].model.get_item_value_model().set_value(idx)
+
+    def _refresh_class_name_combo(self) -> None:
+        """Repopulate the class name ComboBox from disk and update cache."""
+        self._class_names = self._scan_class_names()
+        self._repopulate_combo("class_name", self._class_names)
+        # Re-select previously chosen class if it still exists
+        if self._class_name and self._class_name in self._class_names:
+            idx = self._class_names.index(self._class_name)
+            self._widgets["class_name"].model.get_item_value_model().set_value(idx)
+
     def _refresh_trajectory_lists(self) -> None:
         """Refresh trajectory dropdowns from the trajectory directory."""
         names = self._traj_manager.list_trajectory_names()
@@ -415,22 +490,21 @@ class DataCollectorWindow:
                         lambda m: self._on_project_setting_changed()
                     )
 
-                # Environment
+                # Environment (picker populated from environments folder)
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Environment:", width=_LABEL_WIDTH)
-                    self._widgets["environment"] = ui.StringField()
-                    self._widgets["environment"].model.set_value(self._environment)
-                    self._widgets["environment"].model.add_end_edit_fn(
+                    self._widgets["environment"] = ui.ComboBox(0, height=_FIELD_HEIGHT)
+                    self._widgets["environment"].model.get_item_value_model().add_value_changed_fn(
                         lambda m: self._on_project_setting_changed()
                     )
 
-                # Class Name (used for folder layout, asset scan subfolder,
+                # Class Name (picker populated from asset root folder subfolders;
+                # used for folder layout, asset scan subfolder,
                 # and the semantic label applied to swapped assets).
                 with ui.HStack(height=_FIELD_HEIGHT):
                     ui.Label("Class Name:", width=_LABEL_WIDTH)
-                    self._widgets["class_name"] = ui.StringField()
-                    self._widgets["class_name"].model.set_value(self._class_name)
-                    self._widgets["class_name"].model.add_end_edit_fn(
+                    self._widgets["class_name"] = ui.ComboBox(0, height=_FIELD_HEIGHT)
+                    self._widgets["class_name"].model.get_item_value_model().add_value_changed_fn(
                         lambda m: self._on_project_setting_changed()
                     )
 
@@ -963,10 +1037,12 @@ class DataCollectorWindow:
     # ================================================================= #
 
     def _on_project_setting_changed(self) -> None:
-        """Called when root folder, environment, or class fields are edited."""
+        """Called when root folder, environment, or class picker changes."""
+        if self._initializing:
+            return
         self._root_folder = self._widgets["root_folder"].model.get_value_as_string().strip()
-        self._environment = self._widgets["environment"].model.get_value_as_string().strip()
-        self._class_name = self._widgets["class_name"].model.get_value_as_string().strip()
+        self._environment = self._current_environment()
+        self._class_name = self._current_class_name()
         # Clear location when project context changes — the new env/class
         # combo may have completely different locations.
         self._location_manager.current_location = ""
@@ -980,8 +1056,8 @@ class DataCollectorWindow:
         class name onto the asset browser as the semantic label.
         """
         self._root_folder = self._widgets["root_folder"].model.get_value_as_string().strip()
-        self._environment = self._widgets["environment"].model.get_value_as_string().strip()
-        self._class_name = self._widgets["class_name"].model.get_value_as_string().strip()
+        self._environment = self._current_environment()
+        self._class_name = self._current_class_name()
         self._resolution_w = self._widgets["res_w"].model.get_value_as_int()
         self._resolution_h = self._widgets["res_h"].model.get_value_as_int()
         self._rt_subframes = self._widgets["rt_subframes"].model.get_value_as_int()
@@ -1660,22 +1736,76 @@ class DataCollectorWindow:
             ):
                 total_locs = len(loc_traj_map)
 
+                # ---- [STAGE-CHANGE] Begin ---- #
+                carb.log_info(
+                    f"[BLV] Brainrot: === env transition {env_idx + 1}/"
+                    f"{total_envs} begin ==="
+                )
+                carb.log_info(
+                    f"[BLV] Brainrot: target scene '{env_name}' "
+                    f"-> {usd_path}"
+                )
+
                 # -- Load the USD scene for this environment --
                 self._widgets["brainrot_status"].text = (
                     f"Env {env_idx + 1}/{total_envs}: {env_name} "
                     f"— loading scene..."
                 )
+
+                # -- [1/7] Tear down recorder (drain orchestrator,
+                #          detach writer, destroy render product).
                 carb.log_info(
-                    f"[BLV] Brainrot: loading scene {usd_path}"
+                    f"[BLV] Brainrot: [1/7] recorder.is_setup="
+                    f"{recorder.is_setup} — draining + tearing down "
+                    f"for stage change"
+                )
+                if recorder.is_setup:
+                    await recorder.prepare_for_stage_change_async()
+                carb.log_info(
+                    "[BLV] Brainrot: [1/7] recorder teardown complete"
                 )
 
-                # Teardown recorder before stage change (render product
-                # references the old camera prim which will be destroyed)
-                if recorder.is_setup:
-                    recorder.teardown()
+                # -- [2/7] Quiesce per-frame callbacks & stale prim refs.
+                gamepad_was_enabled = self._camera_ctrl.is_enabled
+                carb.log_info(
+                    f"[BLV] Brainrot: [2/7] quiescing — gamepad_enabled="
+                    f"{gamepad_was_enabled}"
+                )
+                if gamepad_was_enabled:
+                    self._camera_ctrl.disable()
+                # Clear asset browser state — all prim paths from the
+                # old stage are about to become invalid.
+                self._asset_browser._current_prim_path = ""
+                self._asset_browser._labeled_prim_paths.clear()
+                self._stage_changing = True
+                carb.log_info(
+                    "[BLV] Brainrot: [2/7] stage_changing guard raised"
+                )
 
+                # -- [3/7] Yield a couple of frames so any queued
+                #          per-frame work finishes cleanly on the old
+                #          stage before we swap it out.
+                for _ in range(2):
+                    await omni.kit.app.get_app().next_update_async()
+                carb.log_info(
+                    "[BLV] Brainrot: [3/7] pre-swap idle frames done"
+                )
+
+                # -- [4/7] Swap the USD stage.
+                carb.log_info(
+                    f"[BLV] Brainrot: [4/7] open_stage_async start "
+                    f"-> {usd_path}"
+                )
                 usd_context = omni.usd.get_context()
                 success, error = await usd_context.open_stage_async(usd_path)
+                carb.log_info(
+                    f"[BLV] Brainrot: [4/7] open_stage_async returned "
+                    f"success={success}"
+                )
+
+                # Stage is loaded — safe to access prims again
+                self._stage_changing = False
+
                 if not success:
                     carb.log_error(
                         f"[BLV] Brainrot: failed to load scene "
@@ -1686,15 +1816,36 @@ class DataCollectorWindow:
                         completed_units += total_assets * len(trajs)
                     continue
 
-                # Wait for scene to settle
+                # -- [5/7] Wait for scene to settle.
+                carb.log_info(
+                    f"[BLV] Brainrot: [5/7] warming up renderer "
+                    f"({_SCENE_WARMUP_FRAMES} frames)"
+                )
                 for _ in range(_SCENE_WARMUP_FRAMES):
                     await omni.kit.app.get_app().next_update_async()
+                carb.log_info("[BLV] Brainrot: [5/7] warmup done")
 
-                # Ensure camera prim exists in the new scene
+                # -- [6/7] Ensure camera prim exists in the new scene.
+                carb.log_info(
+                    "[BLV] Brainrot: [6/7] ensuring camera prim in new stage"
+                )
                 self._camera_ctrl._ensure_camera_prim()
+                if gamepad_was_enabled:
+                    self._camera_ctrl.enable()
+                carb.log_info(
+                    "[BLV] Brainrot: [6/7] camera prim ready"
+                )
+
+                # -- [7/7] Stage-change done. ---- #
+                carb.log_info(
+                    f"[BLV] Brainrot: [7/7] === env transition "
+                    f"{env_idx + 1}/{total_envs} end ==="
+                )
 
                 # Update environment in UI and project paths
-                self._widgets["environment"].model.set_value(env_name)
+                if env_name in self._env_names:
+                    idx = self._env_names.index(env_name)
+                    self._widgets["environment"].model.get_item_value_model().set_value(idx)
                 self._environment = env_name
                 self._location_manager.set_base_directory(root, cls, env_name)
 
@@ -1704,6 +1855,9 @@ class DataCollectorWindow:
                     total_trajs = len(traj_names)
 
                     # Switch to this location
+                    carb.log_info(
+                        f"[BLV] Brainrot: switching to location '{loc_name}'"
+                    )
                     self._switch_to_location(loc_name)
                     self._refresh_location_list()
 
@@ -1714,6 +1868,10 @@ class DataCollectorWindow:
 
                     for asset_idx in range(total_assets):
                         # Load asset at this location's spawn transform
+                        carb.log_info(
+                            f"[BLV] Brainrot: loading asset "
+                            f"{asset_idx + 1}/{total_assets}"
+                        )
                         self._asset_browser.load_asset(
                             asset_idx, preserve_transform=False
                         )
@@ -1763,6 +1921,10 @@ class DataCollectorWindow:
 
                             # Setup or reinitialize writer
                             if not recorder.is_setup:
+                                carb.log_info(
+                                    f"[BLV] Brainrot: recorder.setup() "
+                                    f"-> {output_dir}"
+                                )
                                 recorder.camera_path = (
                                     self._camera_ctrl.camera_path
                                 )
@@ -1773,6 +1935,10 @@ class DataCollectorWindow:
                                     rt_subframes=rt_subframes,
                                 )
                             else:
+                                carb.log_info(
+                                    f"[BLV] Brainrot: recorder."
+                                    f"reinitialize_writer() -> {output_dir}"
+                                )
                                 recorder.reinitialize_writer(output_dir)
 
                             sampled_indices = list(
@@ -1821,10 +1987,15 @@ class DataCollectorWindow:
                                 f"({n_captures} frames -> {output_dir})"
                             )
 
-                # Teardown recorder at end of this environment (render
-                # product will be invalid after next scene load)
+                # Prepare recorder for the next stage change — drain
+                # the orchestrator, detach the writer, and destroy the
+                # render product while this stage is still alive.
                 if recorder.is_setup:
-                    recorder.teardown()
+                    carb.log_info(
+                        f"[BLV] Brainrot: end of env '{env_name}' — "
+                        f"recorder teardown before next stage swap"
+                    )
+                    await recorder.prepare_for_stage_change_async()
 
         except asyncio.CancelledError:
             carb.log_info("[BLV] Brainrot mode was cancelled.")
@@ -1833,6 +2004,10 @@ class DataCollectorWindow:
             carb.log_error(f"[BLV] Brainrot error: {exc}")
             self._widgets["brainrot_status"].text = f"Error: {exc}"
         finally:
+            # Always clear the stage-changing guard in case we were
+            # cancelled or errored mid-transition.
+            self._stage_changing = False
+
             if recorder.is_setup:
                 recorder.teardown()
             self._default_run_name = None
@@ -1840,7 +2015,9 @@ class DataCollectorWindow:
 
             # Restore original environment and location
             if original_env:
-                self._widgets["environment"].model.set_value(original_env)
+                if original_env in self._env_names:
+                    idx = self._env_names.index(original_env)
+                    self._widgets["environment"].model.get_item_value_model().set_value(idx)
                 self._environment = original_env
             if original_location:
                 try:
@@ -1904,16 +2081,16 @@ class DataCollectorWindow:
         self._widgets["ab_current"].text = "Current: None"
 
     def _current_class_name(self) -> str:
-        """Return the Project Settings Class Name field, stripped."""
+        """Return the Project Settings Class Name from the ComboBox."""
         if "class_name" not in self._widgets:
             return self._class_name
-        return self._widgets["class_name"].model.get_value_as_string().strip()
+        return self._get_combo_selected_string("class_name", self._class_names)
 
     def _current_environment(self) -> str:
-        """Return the Project Settings Environment field, stripped."""
+        """Return the Project Settings Environment from the ComboBox."""
         if "environment" not in self._widgets:
             return self._environment
-        return self._widgets["environment"].model.get_value_as_string().strip()
+        return self._get_combo_selected_string("environment", self._env_names)
 
     def _require_project_context(self, status_widget_key: str) -> bool:
         """Guard for capture/record actions that need env + class to be set.
@@ -2073,6 +2250,10 @@ class DataCollectorWindow:
 
     def _on_status_update(self, event) -> None:
         """Lightweight per-frame callback to keep status labels current."""
+        # Skip all USD prim access while a stage is being swapped
+        if self._stage_changing:
+            return
+
         # Camera controller status
         if self._camera_ctrl.is_enabled:
             slow = "ON" if self._camera_ctrl.slow_mode else "OFF"

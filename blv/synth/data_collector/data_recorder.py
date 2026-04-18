@@ -309,6 +309,143 @@ class DataRecorder:
             )
         self._release_resources(log_warnings=True)
 
+    async def prepare_for_stage_change_async(self) -> None:
+        """Drain the orchestrator, detach the writer, and destroy the
+        render product **before** the USD stage is swapped.
+
+        This is the async replacement for ``prepare_for_stage_change``.
+        The steps and ordering matter:
+
+        1. ``rep.orchestrator.wait_until_complete_async()`` — drain any
+           in-flight capture work so there is no pending OmniGraph tick
+           holding a ref to the old render product's hydra texture.
+        2. ``writer.detach()`` — disconnect annotators first (the
+           NVIDIA-recommended order).
+        3. ``render_product.hydra_texture.set_updates_enabled(False)`` —
+           stop the hydra texture from being scheduled for any further
+           updates while we tear it down.
+        4. ``render_product.destroy()`` — release GPU / hydra resources
+           while the current stage is still alive and its hydra
+           bindings are still valid.
+        5. Yield a frame so Kit can run the destructors fully before we
+           kick off ``open_stage_async`` on a new USD.
+
+        Skipping ``destroy()`` (the previous behaviour) leaves the C++
+        render product alive with a dangling hydra texture handle after
+        the stage teardown, which crashes the next time any orchestrator
+        tick fires.  Calling ``destroy()`` *without* draining the
+        orchestrator first would free a texture that a scheduled tick
+        is about to write to — same crash from the other direction.
+        Draining + destroy in order is the only safe combination.
+        """
+        import omni.kit.app
+
+        carb.log_info(
+            "[BLV] DataRecorder: prepare_for_stage_change_async — begin"
+        )
+
+        # 1. Drain the orchestrator so no capture step is pending.
+        try:
+            await rep.orchestrator.wait_until_complete_async()
+            carb.log_info(
+                "[BLV] DataRecorder: orchestrator drained"
+            )
+        except Exception as exc:
+            carb.log_warn(
+                f"[BLV] wait_until_complete_async warning: {exc}"
+            )
+
+        # 2. Detach the writer (before destroying the render product).
+        if self._writer is not None:
+            try:
+                self._writer.detach()
+                carb.log_info("[BLV] DataRecorder: writer detached")
+            except Exception as exc:
+                carb.log_warn(
+                    f"[BLV] Writer detach warning (stage change): {exc}"
+                )
+            self._writer = None
+
+        # 3. Disable further hydra texture updates, then destroy the
+        # render product while its stage is still alive.
+        if self._render_product is not None:
+            try:
+                hydra_tex = getattr(self._render_product, "hydra_texture", None)
+                if hydra_tex is not None:
+                    try:
+                        hydra_tex.set_updates_enabled(False)
+                        carb.log_info(
+                            "[BLV] DataRecorder: hydra updates disabled"
+                        )
+                    except Exception as exc:
+                        carb.log_warn(
+                            f"[BLV] set_updates_enabled(False) warning: {exc}"
+                        )
+            except Exception as exc:
+                carb.log_warn(
+                    f"[BLV] hydra_texture accessor warning: {exc}"
+                )
+
+            try:
+                self._render_product.destroy()
+                carb.log_info(
+                    "[BLV] DataRecorder: render product destroyed"
+                )
+            except Exception as exc:
+                carb.log_warn(
+                    f"[BLV] render_product.destroy warning: {exc}"
+                )
+            self._render_product = None
+
+        self._is_setup = False
+
+        # 4. Yield a frame so destructors can run.
+        try:
+            await omni.kit.app.get_app().next_update_async()
+        except Exception:
+            pass
+
+        carb.log_info(
+            "[BLV] DataRecorder: prepare_for_stage_change_async — done"
+        )
+
+    def prepare_for_stage_change(self) -> None:
+        """Synchronous fallback — kept for backwards compatibility.
+
+        Prefer :meth:`prepare_for_stage_change_async` (awaits the
+        Replicator orchestrator drain).  This sync version only detaches
+        the writer and drops references; it may leave a dangling render
+        product if the orchestrator has pending work.
+        """
+        carb.log_warn(
+            "[BLV] prepare_for_stage_change (sync) is deprecated — "
+            "prefer prepare_for_stage_change_async()."
+        )
+        if self._writer is not None:
+            try:
+                self._writer.detach()
+            except Exception as exc:
+                carb.log_warn(f"[BLV] Writer detach warning (stage change): {exc}")
+            self._writer = None
+
+        if self._render_product is not None:
+            try:
+                hydra_tex = getattr(self._render_product, "hydra_texture", None)
+                if hydra_tex is not None:
+                    hydra_tex.set_updates_enabled(False)
+            except Exception:
+                pass
+            try:
+                self._render_product.destroy()
+            except Exception as exc:
+                carb.log_warn(
+                    f"[BLV] render_product.destroy warning: {exc}"
+                )
+            self._render_product = None
+
+        self._is_setup = False
+        carb.log_info("[BLV] DataRecorder prepared for stage change (sync).")
+
     # ------------------------------------------------------------------ #
     #  Internal                                                           #
     # ------------------------------------------------------------------ #

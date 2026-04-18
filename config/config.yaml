@@ -8,9 +8,10 @@
 # environment + asset_class_name are typically left blank here so the user
 # enters them in the UI at the start of a session and clicks "Apply Settings"
 # to resolve all derived paths.
-asset_root_folder: "/media/hochul/CrucialX10/NeurIPS_Dataset/synthetic_objects"
-root_folder: "/media/hochul/CrucialX10/NeurIPS_Dataset/collected_data"
-environments_folder: "/media/hochul/Crucial X10/NeurIPS_Dataset/environments"
+
+asset_root_folder: "/home/shiven/Desktop/NeurIPS_Dataset/synthetic_objects"
+root_folder: "/home/shiven/Desktop/NeurIPS_Dataset/collected_data"
+environments_folder: "/home/shiven/Desktop/NeurIPS_Dataset/environments"
 environment: ""
 asset_class_name: ""
 
