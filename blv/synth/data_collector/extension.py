@@ -47,8 +47,9 @@ class BLVSynthDataCollectorExtension(omni.ext.IExt):
         carb.log_info(f"[BLV] BLVSynthDataCollectorExtension starting up (ext_id={ext_id})")
 
         # Lazy import so that the heavy module graph is only loaded when the
-        # extension is actually enabled.
-        from .ui import DataCollectorWindow
+        # extension is actually enabled.  ``.ui`` is now a package
+        # containing window.py + sections/*.py.
+        from .ui.window import DataCollectorWindow
 
         self._window = DataCollectorWindow()
 

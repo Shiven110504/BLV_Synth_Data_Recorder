@@ -23,6 +23,11 @@ Enable the extension ``blv.synth.data_collector`` in the Extension Manager.  A
 menu item will appear under *Window → BLV Synth Data Collector*.
 """
 
-from .extension import BLVSynthDataCollectorExtension  # noqa: F401
-
 __version__ = "2.0.0"
+
+try:
+    from .extension import BLVSynthDataCollectorExtension  # noqa: F401
+except ImportError:
+    # Imported outside Isaac Sim (unit tests, CLI bootstrap) — extension
+    # entry point requires carb/omni which aren't always available.
+    pass

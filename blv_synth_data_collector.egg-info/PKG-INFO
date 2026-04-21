@@ -1,3 +1,15 @@
+Metadata-Version: 2.4
+Name: blv-synth-data-collector
+Version: 3.0.0
+Summary: Synthetic data collection tool for BLV accessibility object detection (Isaac Sim 5.1 extension + headless CLI)
+Author: Shiven Patel
+Keywords: synthetic data,BLV,accessibility,data collection,gamepad,replicator,isaac sim
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Provides-Extra: test
+Requires-Dist: pytest>=7; extra == "test"
+Requires-Dist: pyyaml>=6; extra == "test"
+
 # BLV Synth Data Collector
 
 **Platform**: Isaac Sim 5.1.0 / Kit 107.3.3

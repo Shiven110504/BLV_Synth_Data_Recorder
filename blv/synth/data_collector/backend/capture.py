@@ -1,34 +1,34 @@
-"""
-DataRecorder — Replicator-based synthetic data capture.
-=======================================================
+"""DataRecorder — Replicator-based synthetic data capture.
 
-Wraps Omniverse Replicator's ``BasicWriter`` to capture multi-modal data from a
-single camera viewpoint:
+Wraps Omniverse Replicator's ``BasicWriter`` to capture multi-modal
+data from a single camera viewpoint:
 
-* **RGB** — standard colour image
-* **semantic_segmentation** — per-pixel class IDs
-* **colorize_semantic_segmentation** — human-readable colour overlay
-* **bounding_box_2d_tight** — axis-aligned bounding boxes for labelled prims
+* ``rgb`` — standard colour image
+* ``semantic_segmentation`` — per-pixel class IDs
+* ``colorize_semantic_segmentation`` — human-readable colour overlay
+* ``bounding_box_2d_tight`` — axis-aligned bounding boxes for labelled prims
 
 Workflow
 --------
-1. ``setup(output_dir, rt_subframes=4)`` — creates a render product from the
-   camera, initialises the writer, and attaches it.
-2. ``await capture_frame()`` — triggers one Replicator step (async).
-3. ``teardown()`` — detaches the writer and destroys the render product.
-
-The ``capture_frame`` method is deliberately async because
-``rep.orchestrator.step_async()`` must be awaited.  The "Record with
-Trajectory" workflow in the UI calls this in a coroutine.
+1. :meth:`ensure_setup` — idempotent: brings the writer up to date with
+   the desired ``(output_dir, resolution, rt_subframes, camera_path,
+   annotators)``.  Creates / rebuilds the render product on first call
+   or after a stage swap, and swaps only the writer when the output
+   directory changes.  This replaces the manual Setup / Teardown
+   buttons the UI used to expose.
+2. ``await capture_frame()`` — triggers one Replicator step.
+3. :meth:`prepare_for_stage_change_async` — called by
+   :class:`StageController` before the USD stage is swapped.  Drains
+   the orchestrator, detaches the writer, disables the hydra texture,
+   destroys the render product.
 
 Important
 ---------
-* ``captureOnPlay`` is disabled during setup so that the timeline can run
-  without the writer capturing every physics step — we want explicit,
-  per-frame capture only.
-* ``rt_subframes`` controls the number of ray-tracing sub-frames rendered
-  before data is read back.  Higher values reduce temporal noise at the cost
-  of speed.  4 is a good default for RTX 5090.
+* ``captureOnPlay`` is disabled so the timeline can run without the
+  writer grabbing every physics step — we want explicit, per-frame
+  capture only.
+* ``rt_subframes`` controls the number of ray-tracing sub-frames per
+  step.  4 is a good default for an RTX 5090.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ import os
 from typing import Dict, List, Optional, Tuple
 
 import carb
+import omni.kit.app
 import omni.replicator.core as rep
 
 
@@ -77,17 +78,8 @@ def get_enabled_annotator_names(annotators: Dict[str, bool]) -> List[str]:
 
 
 class DataRecorder:
-    """Manages Replicator-based data capture for a single camera.
+    """Manages Replicator-based data capture for a single camera."""
 
-    Parameters
-    ----------
-    camera_path : str
-        USD prim path of the camera to capture from.
-    resolution : tuple[int, int]
-        ``(width, height)`` of the captured images.
-    """
-
-    # Default frame-number padding in filenames (e.g. ``000042.png``)
     FRAME_PADDING: int = 6
 
     def __init__(
@@ -112,17 +104,14 @@ class DataRecorder:
 
     @property
     def is_setup(self) -> bool:
-        """``True`` after :meth:`setup` and before :meth:`teardown`."""
         return self._is_setup
 
     @property
     def frame_count(self) -> int:
-        """Number of frames captured since the last :meth:`setup`."""
         return self._frame_count
 
     @property
     def output_dir(self) -> str:
-        """Active output directory (empty string before setup)."""
         return self._output_dir
 
     @property
@@ -131,12 +120,12 @@ class DataRecorder:
 
     @camera_path.setter
     def camera_path(self, path: str) -> None:
-        if self._is_setup:
+        if self._is_setup and path != self._camera_path:
             carb.log_warn(
-                "[BLV] Cannot change camera path while writer is active — "
-                "teardown first."
+                "[BLV] Changing camera_path while the recorder is set up — "
+                "the next ensure_setup() call will rebuild the render product."
             )
-            return
+            self._is_setup = False
         self._camera_path = path
 
     @property
@@ -145,17 +134,12 @@ class DataRecorder:
 
     @resolution.setter
     def resolution(self, res: Tuple[int, int]) -> None:
-        if self._is_setup:
-            carb.log_warn(
-                "[BLV] Cannot change resolution while writer is active — "
-                "teardown first."
-            )
-            return
+        if self._is_setup and tuple(res) != tuple(self._resolution):
+            self._is_setup = False
         self._resolution = res
 
     @property
     def rt_subframes(self) -> int:
-        """Current RT subframes setting."""
         return self._rt_subframes
 
     @rt_subframes.setter
@@ -168,26 +152,63 @@ class DataRecorder:
 
     @annotators.setter
     def annotators(self, val: Dict[str, bool]) -> None:
+        # Annotator change requires a fresh writer.  Mark for rebuild.
+        if self._is_setup and dict(val) != dict(self._annotators):
+            self._is_setup = False
         self._annotators = dict(val)
 
     # ------------------------------------------------------------------ #
     #  Public API                                                         #
     # ------------------------------------------------------------------ #
 
-    def setup(self, output_dir: str, rt_subframes: int = 4) -> None:
-        """Create the render product, initialise the BasicWriter, and attach.
+    def ensure_setup(
+        self,
+        output_dir: str,
+        resolution: Optional[Tuple[int, int]] = None,
+        rt_subframes: Optional[int] = None,
+        camera_path: Optional[str] = None,
+        annotators: Optional[Dict[str, bool]] = None,
+    ) -> None:
+        """Idempotent: bring the recorder up to date with the given inputs.
 
-        Parameters
-        ----------
-        output_dir : str
-            Directory where captured images / annotations will be written.
-            Created automatically if it does not exist.
-        rt_subframes : int
-            Number of RTX sub-frames rendered per capture step.  Higher values
-            reduce noise but take longer.
+        Called lazily from every capture path — removes the need for a
+        user-facing "Setup Writer" button.
+
+        Decision ladder:
+
+        * Not set up (fresh, or just torn down by a stage swap)
+          → full :meth:`setup`.
+        * Already set up but parameters changed
+          → tear down & re-setup.
+        * Already set up, only the output directory differs
+          → :meth:`reinitialize_writer` (keeps the render product alive).
+        * Already set up with the same output_dir
+          → no-op.
         """
+        if resolution is not None:
+            self._resolution = tuple(resolution)
+        if rt_subframes is not None:
+            self._rt_subframes = max(1, int(rt_subframes))
+        if camera_path is not None:
+            self._camera_path = camera_path
+        if annotators is not None:
+            if self._is_setup and dict(annotators) != dict(self._annotators):
+                self._release_resources()
+            self._annotators = dict(annotators)
+
+        if not self._is_setup:
+            self.setup(output_dir, rt_subframes=self._rt_subframes)
+            return
+
+        if os.path.normpath(output_dir) != os.path.normpath(self._output_dir):
+            self.reinitialize_writer(output_dir)
+
+    def setup(self, output_dir: str, rt_subframes: int = 4) -> None:
+        """Create render product, initialise BasicWriter, attach."""
         if self._is_setup:
-            carb.log_warn("[BLV] DataRecorder already set up — call teardown first.")
+            carb.log_warn(
+                "[BLV] DataRecorder already set up — call teardown first."
+            )
             return
 
         self._output_dir = output_dir
@@ -195,15 +216,11 @@ class DataRecorder:
         os.makedirs(output_dir, exist_ok=True)
 
         try:
-            # --- Render product (links camera to output resolution) ---
             self._render_product = rep.create.render_product(
                 self._camera_path, self._resolution
             )
-
-            # --- Disable automatic capture during timeline play ---
             rep.orchestrator.set_capture_on_play(False)
 
-            # --- BasicWriter ---
             self._writer = self._build_writer(output_dir)
             self._writer.attach([self._render_product])
 
@@ -213,22 +230,21 @@ class DataRecorder:
                 f"[BLV] DataRecorder setup complete — output={output_dir}, "
                 f"resolution={self._resolution}, rt_subframes={self._rt_subframes}"
             )
-
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             carb.log_error(f"[BLV] DataRecorder setup failed: {exc}")
-            # Attempt partial cleanup
             self._release_resources()
             raise
 
     def _build_writer(self, output_dir: str):
-        """Create and initialise a fresh BasicWriter using *self._annotators*."""
         writer = rep.writers.get("BasicWriter")
         ann = self._annotators
         writer.initialize(
             output_dir=output_dir,
             rgb=ann.get("rgb", True),
             semantic_segmentation=ann.get("semantic_segmentation", True),
-            colorize_semantic_segmentation=ann.get("colorize_semantic_segmentation", True),
+            colorize_semantic_segmentation=ann.get(
+                "colorize_semantic_segmentation", True
+            ),
             bounding_box_2d_tight=ann.get("bounding_box_2d_tight", True),
             bounding_box_2d_loose=ann.get("bounding_box_2d_loose", False),
             bounding_box_3d=ann.get("bounding_box_3d", False),
@@ -240,14 +256,7 @@ class DataRecorder:
         return writer
 
     def reinitialize_writer(self, output_dir: str) -> None:
-        """Swap the BasicWriter to a new *output_dir* without destroying the
-        render product.
-
-        This is the safe way to start a new recording session without
-        tearing down and recreating the render product — which, due to
-        Replicator's internal OmniGraph state, can leave stale node
-        handles and cause ``Invalid NodeObj`` errors on the next setup.
-        """
+        """Swap the BasicWriter without destroying the render product."""
         if not self._is_setup or self._render_product is None:
             carb.log_warn(
                 "[BLV] reinitialize_writer called but recorder is not set up; "
@@ -259,15 +268,13 @@ class DataRecorder:
         self._output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
 
-        # Detach old writer and drop its reference
         if self._writer is not None:
             try:
                 self._writer.detach()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 carb.log_warn(f"[BLV] Writer detach warning during reinit: {exc}")
             self._writer = None
 
-        # Build a fresh writer and attach to the still-alive render product
         self._writer = self._build_writer(output_dir)
         self._writer.attach([self._render_product])
         self._frame_count = 0
@@ -276,13 +283,7 @@ class DataRecorder:
         )
 
     async def capture_frame(self) -> None:
-        """Capture a single frame (async).
-
-        Must be called from an ``asyncio`` coroutine or via
-        ``asyncio.ensure_future()``.  Each call triggers one Replicator step
-        which renders ``rt_subframes`` sub-frames and then reads back the
-        annotator data through the attached writer.
-        """
+        """Capture one frame (async — must be awaited)."""
         if not self._is_setup:
             carb.log_error("[BLV] Cannot capture — DataRecorder not set up.")
             return
@@ -290,40 +291,96 @@ class DataRecorder:
         try:
             await rep.orchestrator.step_async(
                 rt_subframes=self._rt_subframes,
-                delta_time=0.0,          # don't advance simulation time
+                delta_time=0.0,
                 pause_timeline=False,
             )
             self._frame_count += 1
-        except Exception as exc:
-            carb.log_error(f"[BLV] capture_frame failed at frame {self._frame_count}: {exc}")
+        except Exception as exc:  # noqa: BLE001
+            carb.log_error(
+                f"[BLV] capture_frame failed at frame {self._frame_count}: {exc}"
+            )
 
     def teardown(self) -> None:
-        """Detach the writer and destroy the render product.
+        """Detach the writer, destroy the render product, mark not-setup.
 
-        Safe to call even if setup was never called (no-op in that case).
+        Safe to call even if setup was never invoked.
         """
         if self._is_setup:
             carb.log_info(
-                f"[BLV] DataRecorder teardown — {self._frame_count} frames captured "
-                f"to {self._output_dir}"
+                f"[BLV] DataRecorder teardown — {self._frame_count} frames "
+                f"captured to {self._output_dir}"
             )
         self._release_resources(log_warnings=True)
+
+    async def prepare_for_stage_change_async(self) -> None:
+        """Drain the orchestrator, detach, and destroy the render product.
+
+        Runs as a pre-close hook from :class:`StageController`.  The
+        step ordering here is load-bearing — see the module docstring
+        and the refactor plan for why draining-then-destroy is the only
+        safe combination.  Skipping any step can leave a dangling
+        hydra texture handle that crashes the next orchestrator tick.
+        """
+        carb.log_info("[BLV] DataRecorder: prepare_for_stage_change_async — begin")
+
+        # 1. Drain in-flight work.
+        try:
+            await rep.orchestrator.wait_until_complete_async()
+            carb.log_info("[BLV] DataRecorder: orchestrator drained")
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"[BLV] wait_until_complete_async warning: {exc}")
+
+        # 2. Detach writer first.
+        if self._writer is not None:
+            try:
+                self._writer.detach()
+                carb.log_info("[BLV] DataRecorder: writer detached")
+            except Exception as exc:  # noqa: BLE001
+                carb.log_warn(f"[BLV] Writer detach warning (stage change): {exc}")
+            self._writer = None
+
+        # 3. Disable hydra updates, then destroy the render product.
+        if self._render_product is not None:
+            try:
+                hydra_tex = getattr(self._render_product, "hydra_texture", None)
+                if hydra_tex is not None:
+                    try:
+                        hydra_tex.set_updates_enabled(False)
+                        carb.log_info("[BLV] DataRecorder: hydra updates disabled")
+                    except Exception as exc:  # noqa: BLE001
+                        carb.log_warn(
+                            f"[BLV] set_updates_enabled(False) warning: {exc}"
+                        )
+            except Exception as exc:  # noqa: BLE001
+                carb.log_warn(f"[BLV] hydra_texture accessor warning: {exc}")
+
+            try:
+                self._render_product.destroy()
+                carb.log_info("[BLV] DataRecorder: render product destroyed")
+            except Exception as exc:  # noqa: BLE001
+                carb.log_warn(f"[BLV] render_product.destroy warning: {exc}")
+            self._render_product = None
+
+        self._is_setup = False
+        self._output_dir = ""
+
+        # 4. Yield a frame so Kit can run C++ destructors.
+        try:
+            await omni.kit.app.get_app().next_update_async()
+        except Exception:  # noqa: BLE001
+            pass
+
+        carb.log_info("[BLV] DataRecorder: prepare_for_stage_change_async — done")
 
     # ------------------------------------------------------------------ #
     #  Internal                                                           #
     # ------------------------------------------------------------------ #
 
     def _release_resources(self, log_warnings: bool = False) -> None:
-        """Detach writer and destroy render product.
-
-        Called by both :meth:`teardown` (normal) and after failed setup
-        (best-effort).  When *log_warnings* is ``False``, exceptions are
-        silently swallowed.
-        """
         if self._writer is not None:
             try:
                 self._writer.detach()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 if log_warnings:
                     carb.log_warn(f"[BLV] Writer detach warning: {exc}")
             self._writer = None
@@ -331,9 +388,10 @@ class DataRecorder:
         if self._render_product is not None:
             try:
                 self._render_product.destroy()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 if log_warnings:
                     carb.log_warn(f"[BLV] Render product destroy warning: {exc}")
             self._render_product = None
 
         self._is_setup = False
+        self._output_dir = ""

@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blv-synth-data-collector"
+version = "3.0.0"
+description = "Synthetic data collection tool for BLV accessibility object detection (Isaac Sim 5.1 extension + headless CLI)"
+readme = "docs/README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Shiven Patel" }]
+keywords = [
+    "synthetic data",
+    "BLV",
+    "accessibility",
+    "data collection",
+    "gamepad",
+    "replicator",
+    "isaac sim",
+]
+
+# Runtime dependencies are supplied by Isaac Sim's bundled environment.
+# The listed extras exist only so unit tests can run on a stock Python
+# install (no isaacsim required).
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+    "pyyaml>=6",
+]
+
+[project.scripts]
+blv-collect = "blv.synth.data_collector.cli.__main__:main"
+
+[tool.setuptools]
+# Kit's extension loader drives the actual on-disk layout — this section
+# is here only so pip-installing the package for CLI use works.
+packages = [
+    "blv",
+    "blv.synth",
+    "blv.synth.data_collector",
+    "blv.synth.data_collector.backend",
+    "blv.synth.data_collector.ui",
+    "blv.synth.data_collector.ui.sections",
+    "blv.synth.data_collector.cli",
+    "blv.synth.data_collector.cli.commands",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["blv/synth/data_collector/tests/unit"]
+pythonpath = ["."]
+addopts = "-q"
+# Isaac Sim modules must not leak into the unit test process; conftest
+# stubs them in sys.modules before collection.
