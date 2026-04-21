@@ -455,11 +455,17 @@ class Session:
         """Replay one trajectory against the current asset and capture.
 
         Returns the number of frames captured.  Cancel by cancelling
-        the task — the recorder is left set up for the next run
-        (render product reuse avoids OmniGraph churn).
+        the task.
         """
         if not self._class_name:
             raise ValueError("Class Name is required — apply project settings first")
+
+        # Discard any render product left over from a previous run.
+        # Between workflow invocations, idle Kit ticks can garbage-collect
+        # the OmniGraph nodes backing the product, leaving a zombified
+        # handle that causes "accessed invalid null prim" on the next
+        # step_async.  ensure_setup() below will create a fresh one.
+        self.recorder.teardown()
 
         # Make the capture path self-sufficient — don't require the user
         # to have enabled the gamepad or gone through StageController.
@@ -522,6 +528,9 @@ class Session:
             raise ValueError("Class Name is required — apply project settings first")
         if not self.locations.has_location_selected:
             raise ValueError("No location selected")
+
+        # Discard any render product left over from a previous run.
+        self.recorder.teardown()
 
         # Make the capture path self-sufficient — don't require the user
         # to have enabled the gamepad or gone through StageController.
@@ -610,6 +619,12 @@ class Session:
         """
         if not self._class_name:
             raise ValueError("Class Name is required — apply project settings first")
+
+        # Discard any render product left over from a previous run.
+        # The first switch_to() would also tear down via its pre-close
+        # hook, but doing it here avoids C++ errors from trying to drain
+        # a stale orchestrator inside that hook.
+        self.recorder.teardown()
 
         plans = _paths.plan_collect_all(
             self._root_folder, self._class_name, envs_folder
