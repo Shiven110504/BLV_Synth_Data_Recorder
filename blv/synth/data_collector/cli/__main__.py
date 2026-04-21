@@ -1,11 +1,18 @@
-"""``python -m blv.synth.data_collector.cli`` / ``blv-collect`` entry point."""
+"""``python -m blv.synth.data_collector.cli`` / ``blv-collect`` entry point.
+
+Exposes three headless-capable subcommands that mirror the GUI:
+
+* ``list``         — inventory on disk, no Isaac boot.
+* ``record-all``   — GUI "Record All Trajectories" (one env + one location).
+* ``collect-all``  — GUI "Collect All Data" (every env × location × asset × traj).
+"""
 
 from __future__ import annotations
 
 import argparse
 import sys
 
-from .commands import collect_all_cmd, list_cmd, run_cmd
+from .commands import collect_all_cmd, list_cmd, record_all_cmd
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -15,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     list_cmd.add_parser(subparsers)
-    run_cmd.add_parser(subparsers)
+    record_all_cmd.add_parser(subparsers)
     collect_all_cmd.add_parser(subparsers)
     return parser
 

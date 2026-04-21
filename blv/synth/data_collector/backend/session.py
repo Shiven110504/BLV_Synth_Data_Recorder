@@ -122,6 +122,11 @@ class Session:
         # Run-folder cache — reset between workflows.
         self._default_run_name: Optional[str] = None
 
+        # Trajectory name the user typed into the UI.  Read by the
+        # gamepad X-button path so gamepad-started recordings get the
+        # same filename as button-started ones.
+        self._pending_traj_name: str = ""
+
         # The user binds this to toggle trajectory recording from the
         # gamepad X button.  The UI re-populates the name.
         self.camera.record_toggle_callback = self._on_gamepad_record_toggle
@@ -191,6 +196,18 @@ class Session:
         ):
             self.stage.add_pre_close_hook(hook)
 
+        async def ensure_camera_prim() -> None:
+            # Ensure the BLV camera prim exists on the freshly opened
+            # stage before the DataRecorder tries to create a render
+            # product.  Without this, collect-all fails with "no valid
+            # sensor paths" when the gamepad was never enabled.
+            try:
+                self.camera.ensure_camera_prim()
+            except Exception as exc:  # noqa: BLE001
+                carb.log_warn(
+                    f"[BLV] Could not ensure camera prim post-stage-swap: {exc}"
+                )
+
         async def reenable_gamepad() -> None:
             if self._gamepad_was_enabled_before_swap:
                 try:
@@ -201,6 +218,7 @@ class Session:
                     )
                 self._gamepad_was_enabled_before_swap = False
 
+        self.stage.add_post_open_hook(ensure_camera_prim)
         self.stage.add_post_open_hook(reenable_gamepad)
 
     # ------------------------------------------------------------------ #
@@ -278,6 +296,14 @@ class Session:
     #  Trajectory recording / playback                                    #
     # ------------------------------------------------------------------ #
 
+    def set_trajectory_name(self, name: str) -> None:
+        """Stash the trajectory-name the user has typed into the UI.
+
+        Used by the gamepad X-button path so hitting X produces the
+        same filename the button would.
+        """
+        self._pending_traj_name = (name or "").strip()
+
     def start_trajectory_recording(self, name: str) -> None:
         self.traj_recorder.start_recording(name=name, environment=self._environment)
 
@@ -285,7 +311,8 @@ class Session:
         """Stop and save the in-progress recording.
 
         Returns the file path written to disk, or ``None`` if nothing
-        was captured.
+        was captured.  Emits ``"trajectory_saved"`` on the bus so the
+        UI can refresh its playback / record-with-trajectory dropdowns.
         """
         if not self.traj_recorder.is_recording:
             return None
@@ -293,19 +320,27 @@ class Session:
         if data.get("frame_count", 0) == 0:
             return None
         filename = f"{data.get('name', 'trajectory')}.json"
-        return self.traj_manager.save(data, filename)
+        path = self.traj_manager.save(data, filename)
+        try:
+            self.bus.emit("trajectory_saved", path)
+        except Exception as exc:  # noqa: BLE001
+            carb.log_warn(f"[BLV] trajectory_saved emit failed: {exc}")
+        return path
 
     def _on_gamepad_record_toggle(self) -> None:
         """Handle the X-button: toggle trajectory recording in-place."""
         if self.traj_recorder.is_recording:
             self.stop_trajectory_recording()
         else:
-            # The UI usually supplies a better name; the gamepad path
-            # falls back to a timestamped default.
-            from datetime import datetime
+            # Prefer the name the user typed in the UI.  Fall back to
+            # a timestamp only if nothing was set.
+            name = self._pending_traj_name
+            if not name:
+                from datetime import datetime
 
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.start_trajectory_recording(name=f"traj_{stamp}")
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                name = f"traj_{stamp}"
+            self.start_trajectory_recording(name=name)
 
     def play_trajectory(
         self, filename: str, on_complete: Optional[Callable[[], None]] = None
@@ -426,6 +461,10 @@ class Session:
         if not self._class_name:
             raise ValueError("Class Name is required — apply project settings first")
 
+        # Make the capture path self-sufficient — don't require the user
+        # to have enabled the gamepad or gone through StageController.
+        self.camera.ensure_camera_prim()
+
         traj_stem = os.path.splitext(trajectory_filename)[0]
         output_dir = self.capture_output_dir(traj_stem)
         traj_path = os.path.join(self.traj_manager.directory, trajectory_filename)
@@ -483,6 +522,11 @@ class Session:
             raise ValueError("Class Name is required — apply project settings first")
         if not self.locations.has_location_selected:
             raise ValueError("No location selected")
+
+        # Make the capture path self-sufficient — don't require the user
+        # to have enabled the gamepad or gone through StageController.
+        self.camera.ensure_camera_prim()
+
         traj_names = self.traj_manager.list_trajectory_names()
         if not traj_names:
             progress_cb(1.0, "No trajectories at this location", "")

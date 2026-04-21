@@ -1,0 +1,27 @@
+# YAML used by ``blv-collect record-all`` and ``blv-collect collect-all``.
+# Mirrors the values the UI would use, so a CLI batch capture and a GUI
+# batch capture write identical files to the same tree.
+
+root_folder: "/home/shiven/Desktop/NeurIPS_Dataset/collected_data"
+asset_root_folder: "/home/shiven/Desktop/NeurIPS_Dataset/synthetic_objects"
+environments_folder: "/home/shiven/Desktop/NeurIPS_Dataset/environments"
+
+asset_class_name: "elevator"
+environment: "hotel_corridor"
+location: "hc1"
+
+
+# Render settings.
+resolution_width: 1280
+resolution_height: 720
+rt_subframes: 4
+
+# Camera + asset plumbing — rarely need changing.
+camera_path: "/World/BLV_Camera"
+parent_prim_path: "/World"
+frame_step: 50
+
+annotators:
+  rgb: true
+  semantic_segmentation: true
+  bounding_box_2d_tight: true

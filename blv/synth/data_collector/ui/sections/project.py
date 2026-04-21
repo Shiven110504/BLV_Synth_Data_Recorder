@@ -112,6 +112,7 @@ class ProjectSection:
         root = self.widgets["root_folder"].model.get_value_as_string().strip()
         env = self._current_env()
         cls = self._current_class()
+        asset_root = self.widgets["asset_root"].model.get_value_as_string().strip()
         res_w = self.widgets["res_w"].model.get_value_as_int()
         res_h = self.widgets["res_h"].model.get_value_as_int()
         rt = self.widgets["rt_subframes"].model.get_value_as_int()
@@ -123,9 +124,57 @@ class ProjectSection:
             resolution=(res_w, res_h),
             rt_subframes=rt,
         )
-        # Push the class name onto the asset browser so semantic labels
-        # match the project setting.
         self.session.assets.class_name = cls
+
+        # Scan the asset folder for the current class so Prev/Next has
+        # something to iterate.  Matches old ui.py _scan_asset_folder.
+        if asset_root and cls:
+            scan_dir = os.path.join(
+                os.path.expanduser(asset_root), cls,
+            )
+            try:
+                n = self.session.assets.set_folder(scan_dir, class_name=cls)
+                if "ab_status" in self.widgets:
+                    self.widgets["ab_status"].text = (
+                        f"Scanned {scan_dir}: {n} assets"
+                    )
+            except Exception as exc:
+                if "ab_status" in self.widgets:
+                    self.widgets["ab_status"].text = f"Scan error: {exc}"
+
+        # Auto-select first location if none is selected — triggers the
+        # trajectory manager to rebind to that location's trajectories
+        # dir.  Matches old ui.py _on_apply_project_settings.
+        locations = self.session.locations.list_locations()
+        if locations and not self.session.locations.has_location_selected:
+            self.session.set_location(locations[0])
+
+        # Load the first location's saved spawn transform and the first
+        # scanned asset so the user has something visible the moment
+        # Apply finishes.
+        loc = self.session.locations.current_location
+        if loc:
+            try:
+                data = self.session.locations.load_location(loc)
+                from pxr import Gf
+                t = data["spawn_transform"]["translate"]
+                r = data["spawn_transform"]["orient"]
+                s = data["spawn_transform"]["scale"]
+                self.session.assets.set_spawn_transform(
+                    Gf.Vec3d(*t),
+                    Gf.Quatd(r[0], r[1], r[2], r[3]),
+                    Gf.Vec3d(*s),
+                )
+            except Exception:
+                pass
+        if self.session.assets.total_assets > 0:
+            try:
+                self.session.assets.load_asset(0, preserve_transform=False)
+            except Exception as exc:
+                if "ab_status" in self.widgets:
+                    self.widgets["ab_status"].text = (
+                        f"Asset load error: {exc}"
+                    )
 
         self.widgets["project_status"].text = (
             f"env={env or '(none)'} | class={cls or '(none)'} | "

@@ -66,6 +66,7 @@ class Defaults:
     asset_class_name: str = ""
     asset_root_folder: str = ""
     environments_folder: str = ""
+    location: str = ""
 
     # --- Camera ---
     camera_path: str = "/World/BLV_Camera"
@@ -77,6 +78,7 @@ class Defaults:
     resolution_width: int = 1280
     resolution_height: int = 720
     rt_subframes: int = 4
+    frame_step: int = 1
 
     # --- Asset browser ---
     parent_prim_path: str = "/World"

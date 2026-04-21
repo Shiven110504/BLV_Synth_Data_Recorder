@@ -10,7 +10,7 @@ Controls
     Right trigger       Move up
     Left trigger        Move down
     D-pad up / down     Increase / decrease move speed
-    Left bumper         Toggle slow mode (0.25×)
+    Left bumper         Toggle slow mode (0.5×)
     X button            Toggle trajectory recording (start / stop & save)
 
 Coordinate system
@@ -55,7 +55,7 @@ class GamepadCameraController:
     DEFAULT_LOOK_SPEED: float = 60.0
     DEAD_ZONE: float = 0.15
     SPEED_STEP: float = 2.0
-    SLOW_FACTOR: float = 0.25
+    SLOW_FACTOR: float = 0.5
     MIN_MOVE_SPEED: float = 0.1
     MIN_LOOK_SPEED: float = 1.0
 
@@ -116,6 +116,10 @@ class GamepadCameraController:
         self._ensure_camera_prim()
         self._read_camera_pose()
         self._raw_inputs.clear()
+        # Reset slow mode — toggle state must not persist across
+        # enable/disable cycles.  Stale state caused the "look speed
+        # stuck slow after re-enable" bug.
+        self._slow_mode = False
 
         self._gp_sub = self._input.subscribe_to_gamepad_events(
             self._gamepad, self._on_gamepad_event
@@ -172,6 +176,16 @@ class GamepadCameraController:
 
     def destroy(self) -> None:
         self.disable()
+
+    def ensure_camera_prim(self) -> None:
+        """Create the camera prim on the current stage if it's missing.
+
+        Public wrapper around the internal setup routine.  Called after
+        a stage swap so the DataRecorder can bind its render product to
+        a valid camera even when the gamepad is never enabled.
+        """
+        self._ensure_camera_prim()
+        self._read_camera_pose()
 
     # ------------------------------------------------------------------ #
     #  Properties                                                         #
@@ -386,14 +400,13 @@ class GamepadCameraController:
         pitch_in = ri.get(G.RIGHT_STICK_UP, 0.0) - ri.get(G.RIGHT_STICK_DOWN, 0.0)
         vert   = ri.get(G.RIGHT_TRIGGER, 0.0)    - ri.get(G.LEFT_TRIGGER, 0.0)
 
-        self._yaw   -= yaw_in  * self._look_speed * dt
-        self._pitch += pitch_in * self._look_speed * dt
+        slow = self.SLOW_FACTOR if self._slow_mode else 1.0
 
-        speed = (
-            self._move_speed
-            * (self.SLOW_FACTOR if self._slow_mode else 1.0)
-            * self._units_per_meter
-        )
+        look = self._look_speed * slow
+        self._yaw   -= yaw_in  * look * dt
+        self._pitch += pitch_in * look * dt
+
+        speed = self._move_speed * slow * self._units_per_meter
         yaw_rad = math.radians(self._yaw)
 
         forward = Gf.Vec3d(-math.sin(yaw_rad), math.cos(yaw_rad), 0.0)

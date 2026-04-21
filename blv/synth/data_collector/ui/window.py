@@ -36,12 +36,17 @@ class DataCollectorWindow:
             width=_style.WINDOW_WIDTH,
             height=_style.WINDOW_HEIGHT,
         )
+        self._window.deferred_dock_in("Property")
+
 
         self._widgets: Dict[str, Any] = {}
         self._sections: List[Any] = []
         self._update_sub = None
 
         self._session = Session(defaults=load_config())
+        self._session.bus.subscribe(
+            "trajectory_saved", lambda *_: self._on_project_changed()
+        )
 
         with self._window.frame:
             with ui.ScrollingFrame():

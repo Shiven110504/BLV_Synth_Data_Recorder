@@ -12,8 +12,9 @@
 asset_root_folder: "/home/shiven/Desktop/NeurIPS_Dataset/synthetic_objects"
 root_folder: "/home/shiven/Desktop/NeurIPS_Dataset/collected_data"
 environments_folder: "/home/shiven/Desktop/NeurIPS_Dataset/environments"
-environment: ""
 asset_class_name: ""
+environment: ""
+location: ""
 
 # --- Camera ---
 camera_path: "/World/BLV_Camera"
@@ -25,6 +26,7 @@ focal_length: 28.0   # in mm — USD uses "tenths of a scene unit"; see camera s
 resolution_width: 1280
 resolution_height: 720
 rt_subframes: 4
+frame_step: 50 
 
 # --- Asset Browser ---
 # asset_root_folder is the parent directory; the asset_class_name from the

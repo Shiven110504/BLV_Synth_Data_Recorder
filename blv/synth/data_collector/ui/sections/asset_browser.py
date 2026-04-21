@@ -127,8 +127,32 @@ class AssetBrowserSection:
         idx = current_item.get_value_as_int()
         if 0 <= idx < len(self._location_names):
             name = self._location_names[idx]
+            if name == self.session.locations.current_location:
+                return
             self.session.set_location(name)
+            # Load the saved spawn transform for this location and push
+            # it onto the currently-loaded asset so the preview matches.
+            try:
+                data = self.session.locations.load_location(name)
+                from pxr import Gf
+                t = data["spawn_transform"]["translate"]
+                r = data["spawn_transform"]["orient"]
+                s = data["spawn_transform"]["scale"]
+                self.session.assets.set_spawn_transform(
+                    Gf.Vec3d(*t),
+                    Gf.Quatd(r[0], r[1], r[2], r[3]),
+                    Gf.Vec3d(*s),
+                )
+                idx_asset = self.session.assets.current_index
+                if idx_asset >= 0:
+                    self.session.assets.load_asset(
+                        idx_asset, preserve_transform=False,
+                    )
+            except Exception:
+                pass
             self.widgets["loc_status"].text = f"Location: {name}"
+            # Tell the other sections (trajectory lists, etc.) to refresh.
+            self._refresh_cb()
 
     # -- New-location flow --------------------------------------------- #
     def _on_new_clicked(self) -> None:
@@ -218,10 +242,19 @@ class AssetBrowserSection:
         self._update_current_label()
 
     def _update_current_label(self) -> None:
-        stem = getattr(self.session.assets, "current_asset_stem", "") or "None"
-        self.widgets["ab_current"].text = f"Current: {stem}"
+        assets = self.session.assets
+        stem = getattr(assets, "current_asset_stem", "") or "None"
+        total = getattr(assets, "total_assets", 0)
+        idx = getattr(assets, "current_index", -1)
+        if total > 0 and idx >= 0:
+            self.widgets["ab_current"].text = (
+                f"Asset {idx + 1} of {total}: {stem}"
+            )
+        else:
+            self.widgets["ab_current"].text = f"Current: {stem}"
 
     def on_tick(self) -> None:
+        self._update_current_label()
         snap = self.session.assets.read_current_prim_transform()
         if snap is None:
             return

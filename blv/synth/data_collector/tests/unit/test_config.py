@@ -23,6 +23,18 @@ def test_defaults_are_stable_when_no_yaml():
     assert d.move_speed == 60.0
     assert d.look_speed == 30.0
     assert d.root_folder == "~/blv_data"
+    assert d.location == ""
+    assert d.frame_step == 1
+
+
+def test_yaml_sets_location_and_frame_step(tmp_path):
+    path = _write_yaml(tmp_path, """
+        location: "entrance"
+        frame_step: 25
+    """)
+    d = cfg.load_config(yaml_path=path, include_carb=False)
+    assert d.location == "entrance"
+    assert d.frame_step == 25
 
 
 def test_yaml_overrides_hardcoded(tmp_path):

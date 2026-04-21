@@ -1,10 +1,13 @@
-"""``blv-collect collect-all`` — mimic the UI "Collect All Data" button.
+"""``blv-collect record-all`` — mimic the UI "Record All Trajectories" button.
 
-Full matrix: every env × every location × every asset × every
-trajectory discovered under ``environments_folder``.  Equivalent to
-clicking Start in the Collect All Data section of the UI.
+Headless batch over every asset × every trajectory at a single
+environment + single location + single class.  Every required value
+comes from the YAML config — CLI flags only override them.
 
-Every knob comes from the YAML config — CLI flags only override.
+Equivalent GUI flow:
+  1. Project Settings → Apply (env + class + resolution + rt)
+  2. Asset Browser → pick Location
+  3. Capture → Record All Trajectories
 """
 
 from __future__ import annotations
@@ -21,21 +24,22 @@ def _info(msg: str) -> None:
     """Single-line status print — stdout so Kit doesn't tag each line
     as ``[Error]`` in its log (anything written to stderr under an
     ``omni.kit.app`` process is logged at error level)."""
-    print(f"[collect-all] {msg}", flush=True)
+    print(f"[record-all] {msg}", flush=True)
 
 
 def add_parser(subparsers) -> argparse.ArgumentParser:
     p = subparsers.add_parser(
-        "collect-all",
-        help="headless: mimic UI 'Collect All Data' — full env × loc × asset × traj matrix",
+        "record-all",
+        help="headless: mimic UI 'Record All Trajectories' for one env/class/location",
     )
     p.add_argument("--config", default=None, help="Path to YAML config")
+    p.add_argument("--env", dest="env",
+                   help="Override environment name (folder under environments_folder)")
     p.add_argument("--class", dest="class_name",
                    help="Override asset_class_name from YAML")
+    p.add_argument("--location", help="Override location name from YAML")
     p.add_argument("--frame-step", type=int, default=None,
                    help="Capture every Nth frame (default: from YAML, or 1)")
-    p.add_argument("--on-error", choices=("skip", "abort"), default="skip",
-                   help="How to handle env load failures")
     p.set_defaults(func=run)
     return p
 
@@ -51,17 +55,22 @@ def run(args) -> int:
     _info(f"Loading config: {args.config or '(default)'}")
     defaults = load_config(yaml_path=args.config, include_carb=False)
 
+    env = args.env or defaults.environment
     cls = args.class_name or defaults.asset_class_name
+    location = args.location or defaults.location
     frame_step = int(args.frame_step or defaults.frame_step or 1)
-    envs_folder = _paths.normalize(defaults.environments_folder)
+
+    envs_root = _paths.normalize(defaults.environments_folder)
     root = _paths.normalize(defaults.root_folder)
     asset_root = _paths.normalize(defaults.asset_root_folder)
 
     missing = [
         name for name, value in (
+            ("environment", env),
             ("asset_class_name", cls),
+            ("location", location),
             ("root_folder", root),
-            ("environments_folder", envs_folder),
+            ("environments_folder", envs_root),
             ("asset_root_folder", asset_root),
         ) if not value
     ]
@@ -73,27 +82,16 @@ def run(args) -> int:
         )
         return 2
 
-    _info(f"class={cls}  frame_step={frame_step}  on_error={args.on_error}")
+    usd_path = os.path.join(envs_root, env, f"{env}.usd")
+    if not os.path.isfile(usd_path):
+        print(f"ERROR: USD not found: {usd_path}", file=sys.stderr)
+        return 2
+
+    _info(f"env={env}  class={cls}  location={location}  frame_step={frame_step}")
     _info(f"root={root}")
     _info(f"asset_root={asset_root}")
-    _info(f"envs_folder={envs_folder}")
-
-    # Preview the matrix BEFORE booting Isaac — faster failure, and
-    # the user sees exactly what's about to be captured.
-    plans = _paths.plan_collect_all(root, cls, envs_folder)
-    if not plans:
-        print(
-            f"ERROR: no environments with location.json + trajectories "
-            f"under {envs_folder}",
-            file=sys.stderr,
-        )
-        return 2
-    n_envs, n_locs, n_trajs = _paths.plan_totals(plans)
-    _info(f"Plan: {n_envs} envs × {n_locs} locations × {n_trajs} trajectories")
-    for p in plans:
-        _info(f"  env: {p.env_name}  ({p.usd_path})")
-        for loc_name, trajs in p.locations.items():
-            _info(f"    loc: {loc_name}  ({len(trajs)} trajectories)")
+    _info(f"envs_root={envs_root}")
+    _info(f"USD={usd_path}")
 
     t0 = time.monotonic()
     _info("Booting SimulationApp (headless)...")
@@ -108,7 +106,7 @@ def run(args) -> int:
         session = Session(defaults=defaults)
         session.apply_project_settings(
             root_folder=root,
-            environment=defaults.environment,
+            environment=env,
             class_name=cls,
             resolution=defaults.resolution,
             rt_subframes=int(defaults.rt_subframes),
@@ -126,19 +124,64 @@ def run(args) -> int:
             return 2
         _info(f"Found {n_assets} asset(s)")
 
+        _info(f"Setting location: {location}")
+        session.set_location(location)
+        traj_names = session.traj_manager.list_trajectory_names()
+        if not traj_names:
+            print(
+                f"ERROR: no trajectories at {session.traj_manager.directory}",
+                file=sys.stderr,
+            )
+            session.destroy()
+            return 2
+        _info(
+            f"Found {len(traj_names)} trajectory file(s) in "
+            f"{session.traj_manager.directory}"
+        )
+        for t in traj_names:
+            _info(f"  - {t}")
+
+        # Load the location's spawn transform so every asset starts
+        # from the recorded pose.
+        try:
+            from pxr import Gf  # deferred: pxr needs SimulationApp boot
+            loc_data = session.locations.load_location(location)
+            t = loc_data["spawn_transform"]["translate"]
+            r = loc_data["spawn_transform"]["orient"]
+            s = loc_data["spawn_transform"]["scale"]
+            session.assets.set_spawn_transform(
+                Gf.Vec3d(*t),
+                Gf.Quatd(r[0], r[1], r[2], r[3]),
+                Gf.Vec3d(*s),
+            )
+            _info(f"Loaded spawn transform: translate={t}")
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"WARNING: could not load location transform: {exc}",
+                file=sys.stderr,
+            )
+
         async def workflow() -> int:
+            _info(f"Loading stage: {usd_path}")
+            t_swap = time.monotonic()
+            ok = await session.stage.switch_to(usd_path)
+            if not ok:
+                _info("Stage load FAILED")
+                return 1
+            _info(f"Stage loaded in {time.monotonic() - t_swap:.1f}s")
+
+            _info(
+                f"Starting capture: {n_assets} assets × "
+                f"{len(traj_names)} trajectories"
+            )
             t_cap = time.monotonic()
-            result = await session.collect_all(
-                envs_folder=envs_folder,
+            captured = await session.record_all_trajectories(
                 frame_step=frame_step,
-                on_env_error=args.on_error,
                 progress_cb=_print_progress,
             )
-            _info(
-                f"collect_all finished in {time.monotonic() - t_cap:.1f}s — "
-                f"{result} frames"
-            )
-            return result
+            dt = time.monotonic() - t_cap
+            _info(f"Capture finished in {dt:.1f}s — {captured} frames")
+            return 0
 
         task = asyncio.ensure_future(workflow())
 
@@ -155,15 +198,14 @@ def run(args) -> int:
         try:
             while not task.done():
                 app.update()
-            captured = task.result()
+            rc = task.result()
         except asyncio.CancelledError:
             print("\nCancelled.", file=sys.stderr)
-            captured = 0
+            rc = 130
 
-        print(f"\nTotal captured frames: {captured}")
         _info("Tearing down Session")
         session.destroy()
-        return 0
+        return rc
     finally:
         _info("Shutting down SimulationApp")
         shutdown(app)

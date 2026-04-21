@@ -19,6 +19,9 @@ class TrajectoryRecordSection:
                     ui.Label("Trajectory Name:", width=style.LABEL_WIDTH)
                     widgets["traj_name"] = ui.StringField()
                     widgets["traj_name"].model.set_value("trajectory_001")
+                    widgets["traj_name"].model.add_end_edit_fn(
+                        self._on_name_edited
+                    )
 
                 with ui.HStack(height=style.BUTTON_HEIGHT):
                     ui.Button("Record", clicked_fn=self._on_start)
@@ -28,8 +31,24 @@ class TrajectoryRecordSection:
                     "Frames: 0", height=style.FIELD_HEIGHT
                 )
 
+        # Seed the session so the gamepad X-button uses the default
+        # name even if the user never edits the field.
+        self.session.set_trajectory_name(
+            widgets["traj_name"].model.get_value_as_string()
+        )
+
+    def _current_name(self) -> str:
+        return (
+            self.widgets["traj_name"].model.get_value_as_string().strip()
+            or "trajectory"
+        )
+
+    def _on_name_edited(self, model) -> None:
+        self.session.set_trajectory_name(model.get_value_as_string())
+
     def _on_start(self) -> None:
-        name = self.widgets["traj_name"].model.get_value_as_string().strip() or "trajectory"
+        name = self._current_name()
+        self.session.set_trajectory_name(name)
         self.session.start_trajectory_recording(name)
         self.widgets["traj_rec_status"].text = f"Recording: {name}"
 

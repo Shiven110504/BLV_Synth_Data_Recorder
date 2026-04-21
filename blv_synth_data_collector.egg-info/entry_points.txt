@@ -1,0 +1,2 @@
+[console_scripts]
+blv-collect = blv.synth.data_collector.cli.__main__:main
