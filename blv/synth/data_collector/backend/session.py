@@ -234,6 +234,11 @@ class Session:
         rt_subframes: Optional[int] = None,
     ) -> None:
         """Apply (or re-apply) the project-level paths + render settings."""
+        env_or_class_changed = (
+            environment != self._environment
+            or class_name != self._class_name
+        )
+
         self._root_folder = root_folder
         self._environment = environment
         self._class_name = class_name
@@ -248,6 +253,8 @@ class Session:
             self.locations.set_base_directory(
                 root_folder, class_name, environment
             )
+            if env_or_class_changed:
+                self.locations.current_location = ""
             self.traj_manager.set_project_paths(
                 root_folder,
                 environment,
@@ -256,6 +263,7 @@ class Session:
             )
         else:
             self.traj_manager.directory = ""
+            self.locations.current_location = ""
 
         self._default_run_name = None
 
@@ -321,8 +329,9 @@ class Session:
             return None
         filename = f"{data.get('name', 'trajectory')}.json"
         path = self.traj_manager.save(data, filename)
+        frame_count = data.get("frame_count", 0)
         try:
-            self.bus.emit("trajectory_saved", path)
+            self.bus.emit("trajectory_saved", path, frame_count)
         except Exception as exc:  # noqa: BLE001
             carb.log_warn(f"[BLV] trajectory_saved emit failed: {exc}")
         return path
@@ -765,10 +774,14 @@ class Session:
             progress_cb(None, "Cancelled", "")
             raise
         finally:
-            # Leave the stage in the user's original state if we can —
-            # collect-all is a batch job and the user expects the last
-            # thing they were looking at when it finishes.
+            # Restore every path-bearing module to the user's original
+            # state — collect-all mutates _environment, LocationManager
+            # _base_dir, and TrajectoryManager directory during the loop.
             self._environment = original_env
+            if self._class_name and original_env:
+                self.locations.set_base_directory(
+                    self._root_folder, self._class_name, original_env
+                )
             if original_location:
                 self.set_location(original_location)
 

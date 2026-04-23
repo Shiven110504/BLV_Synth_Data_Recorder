@@ -167,7 +167,10 @@ class ProjectSection:
                 )
             except Exception:
                 pass
-        if self.session.assets.total_assets > 0:
+        if (
+            self.session.assets.total_assets > 0
+            and self.session.locations.has_location_selected
+        ):
             try:
                 self.session.assets.load_asset(0, preserve_transform=False)
             except Exception as exc:

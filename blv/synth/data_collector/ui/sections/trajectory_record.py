@@ -19,7 +19,7 @@ class TrajectoryRecordSection:
                     ui.Label("Trajectory Name:", width=style.LABEL_WIDTH)
                     widgets["traj_name"] = ui.StringField()
                     widgets["traj_name"].model.set_value("trajectory_001")
-                    widgets["traj_name"].model.add_end_edit_fn(
+                    widgets["traj_name"].model.add_value_changed_fn(
                         self._on_name_edited
                     )
 
@@ -37,6 +37,10 @@ class TrajectoryRecordSection:
             widgets["traj_name"].model.get_value_as_string()
         )
 
+        self.session.bus.subscribe(
+            "trajectory_saved", self._on_trajectory_saved
+        )
+
     def _current_name(self) -> str:
         return (
             self.widgets["traj_name"].model.get_value_as_string().strip()
@@ -45,6 +49,12 @@ class TrajectoryRecordSection:
 
     def _on_name_edited(self, model) -> None:
         self.session.set_trajectory_name(model.get_value_as_string())
+
+    def _on_trajectory_saved(self, path, frame_count=0) -> None:
+        """Update status when a trajectory is saved by any path (UI or gamepad)."""
+        self.widgets["traj_rec_status"].text = (
+            f"Saved: {path} ({frame_count} frames)"
+        )
 
     def _on_start(self) -> None:
         name = self._current_name()
