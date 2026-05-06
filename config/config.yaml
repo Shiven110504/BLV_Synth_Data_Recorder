@@ -9,12 +9,24 @@
 # enters them in the UI at the start of a session and clicks "Apply Settings"
 # to resolve all derived paths.
 
-asset_root_folder: "/home/shiven/Desktop/NeurIPS_Dataset/synthetic_objects"
-root_folder: "/home/shiven/Desktop/NeurIPS_Dataset/collected_data"
-environments_folder: "/home/shiven/Desktop/NeurIPS_Dataset/environments"
+root_folder: "/media/shiven/NeurIPS_SSD/Synthetic_Data/collected_data"
+asset_root_folder: "/media/shiven/NeurIPS_SSD/Synthetic_Data/synthetic_objects"
+environments_folder: "/media/shiven/NeurIPS_SSD/Synthetic_Data/environments"
+
+# root_folder: "/media/shiven/SSD_1TB/Synthetic_Data/collected_data"
+# asset_root_folder: "/media/shiven/SSD_1TB/Synthetic_Data/synthetic_objects"
+# environments_folder: "/media/shiven/SSD_1TB/Synthetic_Data/environments"
 asset_class_name: ""
 environment: ""
 location: ""
+
+# Multi-class CLI (``blv-collect collect-classes``).  When non-empty,
+# ``collect-classes`` regenerates data for each listed class in turn,
+# inside a single SimulationApp boot.  When empty, ``collect-classes``
+# falls back to ``asset_class_name`` as a one-element list.
+# Examples:
+#   classes: ["handrail", "stairs", "doorway"]
+classes: []
 
 # --- Camera ---
 camera_path: "/World/BLV_Camera"
@@ -43,7 +55,7 @@ annotators:
   colorize_semantic_segmentation: true
   bounding_box_2d_tight: true
   bounding_box_2d_loose: false
-  bounding_box_3d: false
+  bounding_box_3d: true
   instance_segmentation: false
-  normals: false
-  distance_to_image_plane: false
+  normals: true
+  distance_to_image_plane: true

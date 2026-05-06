@@ -44,7 +44,8 @@ the just-opened stage, not to one scavenged from the old stage.
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable, List
+import time
+from typing import Awaitable, Callable, List, Optional
 
 import carb
 import omni.kit.app
@@ -129,13 +130,22 @@ class StageController:
     #  Core switch                                                        #
     # ------------------------------------------------------------------ #
 
-    async def switch_to(self, usd_path: str) -> bool:
+    async def switch_to(
+        self, usd_path: str, timeout: Optional[float] = 300.0
+    ) -> bool:
         """Close the current stage, open *usd_path*, run all hooks.
 
         Returns ``True`` on success, ``False`` if ``open_stage_async``
-        failed.  The caller should treat ``False`` as a terminal error
-        and decide whether to abort the wider workflow (e.g. collect-all
-        may want to skip the failing environment and continue).
+        failed or timed out.  The caller should treat ``False`` as a
+        terminal error and decide whether to abort the wider workflow
+        (e.g. collect-all may want to skip the failing environment and
+        continue).
+
+        ``timeout`` bounds ``open_stage_async``.  ``None`` disables the
+        timeout (legacy behavior).  IsaacSim has been observed to hang
+        opening certain USDs (slow asset resolver, bad references) — the
+        timeout makes that visible and recoverable instead of stalling
+        the whole batch run.
 
         ``is_switching`` is set to ``True`` for the entire duration of
         this method — the guard is cleared in the ``finally`` so it
@@ -199,11 +209,34 @@ class StageController:
             # 7. Open the new stage.  Skip the rest of the pipeline if
             #    this fails — returning False lets the caller decide
             #    whether to abort or continue with the next env.
+            #    Bracketed by log_warn so a hang inside open_stage_async
+            #    is visible in Kit logs (the only signal otherwise is
+            #    the missing "opened" line on the next message).
+            carb.log_warn(
+                f"[BLV] StageController: opening {usd_path} "
+                f"(timeout={timeout}s)"
+            )
+            t_open = time.monotonic()
             try:
-                ok, err = await ctx.open_stage_async(usd_path)
+                if timeout is None:
+                    ok, err = await ctx.open_stage_async(usd_path)
+                else:
+                    ok, err = await asyncio.wait_for(
+                        ctx.open_stage_async(usd_path), timeout=timeout
+                    )
+            except asyncio.TimeoutError:
+                carb.log_error(
+                    f"[BLV] open_stage_async TIMED OUT after "
+                    f"{timeout}s: {usd_path}"
+                )
+                return False
             except Exception as exc:  # noqa: BLE001
                 carb.log_error(f"[BLV] open_stage_async threw: {exc}")
                 return False
+            carb.log_warn(
+                f"[BLV] StageController: opened {usd_path} in "
+                f"{time.monotonic() - t_open:.1f}s"
+            )
             if not ok:
                 carb.log_error(
                     f"[BLV] open_stage_async failed: {err}"

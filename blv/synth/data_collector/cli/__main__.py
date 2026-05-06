@@ -1,10 +1,12 @@
 """``python -m blv.synth.data_collector.cli`` / ``blv-collect`` entry point.
 
-Exposes three headless-capable subcommands that mirror the GUI:
+Exposes four headless-capable subcommands that mirror the GUI:
 
-* ``list``         — inventory on disk, no Isaac boot.
-* ``record-all``   — GUI "Record All Trajectories" (one env + one location).
-* ``collect-all``  — GUI "Collect All Data" (every env × location × asset × traj).
+* ``list``             — inventory on disk, no Isaac boot.
+* ``record-all``       — GUI "Record All Trajectories" (one env + one location).
+* ``collect-all``      — GUI "Collect All Data" (every env × location × asset × traj).
+* ``collect-classes``  — multi-class regeneration: loops collect-all over a
+  configurable list of classes inside one SimulationApp boot.
 """
 
 from __future__ import annotations
@@ -12,7 +14,12 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .commands import collect_all_cmd, list_cmd, record_all_cmd
+from .commands import (
+    collect_all_cmd,
+    collect_classes_cmd,
+    list_cmd,
+    record_all_cmd,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd.add_parser(subparsers)
     record_all_cmd.add_parser(subparsers)
     collect_all_cmd.add_parser(subparsers)
+    collect_classes_cmd.add_parser(subparsers)
     return parser
 
 

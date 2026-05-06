@@ -1,8 +1,8 @@
 """Parser-level tests for the ``blv-collect`` CLI.
 
 We don't boot Isaac here, so the tests cover only argparse wiring: the
-three subcommands exist, ``run`` was removed, and each subcommand
-accepts the flags documented in the README.
+subcommands exist, ``run`` was removed, and each subcommand accepts
+the flags documented in the README.
 """
 
 from __future__ import annotations
@@ -19,7 +19,9 @@ def test_subcommands_registered():
         a for a in parser._actions
         if a.__class__.__name__ == "_SubParsersAction"
     ]
-    assert set(action.choices) == {"list", "record-all", "collect-all"}
+    assert set(action.choices) == {
+        "list", "record-all", "collect-all", "collect-classes",
+    }
 
 
 def test_run_subcommand_removed():
@@ -69,3 +71,30 @@ def test_collect_all_on_error_choices():
     parser = build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["collect-all", "--on-error", "bogus"])
+
+
+def test_collect_classes_defaults():
+    parser = build_parser()
+    args = parser.parse_args(["collect-classes", "--config", "cfg.yaml"])
+    assert args.command == "collect-classes"
+    assert args.classes is None
+    assert args.frame_step is None
+    assert args.on_error == "skip"
+    assert args.on_class_error == "skip"
+    assert args.load_timeout == 300.0
+
+
+def test_collect_classes_overrides():
+    parser = build_parser()
+    args = parser.parse_args([
+        "collect-classes",
+        "--config", "cfg.yaml",
+        "--classes", "handrail,stairs",
+        "--frame-step", "10",
+        "--on-class-error", "abort",
+        "--load-timeout", "60",
+    ])
+    assert args.classes == "handrail,stairs"
+    assert args.frame_step == 10
+    assert args.on_class_error == "abort"
+    assert args.load_timeout == 60.0

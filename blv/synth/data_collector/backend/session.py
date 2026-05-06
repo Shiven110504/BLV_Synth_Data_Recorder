@@ -620,11 +620,16 @@ class Session:
         frame_step: int = 1,
         on_env_error: str = "skip",
         progress_cb: ProgressCb = _null_progress,
+        load_timeout: Optional[float] = 300.0,
     ) -> int:
         """Iterate envs × locations × assets × trajectories.
 
         Uses :meth:`StageController.switch_to` for every environment
         change — no bespoke teardown here.
+
+        ``load_timeout`` bounds the ``open_stage_async`` call inside
+        each ``switch_to``.  ``None`` disables the timeout (legacy
+        behavior).  Default is 5 minutes per env.
         """
         if not self._class_name:
             raise ValueError("Class Name is required — apply project settings first")
@@ -662,10 +667,17 @@ class Session:
                 progress_cb(
                     completed_units / total_units if total_units else None,
                     f"Env {env_idx + 1}/{len(plans)}: {plan.env_name}",
-                    "loading scene",
+                    f"loading {plan.usd_path}",
+                )
+                carb.log_warn(
+                    f"[BLV] collect_all: loading env "
+                    f"{env_idx + 1}/{len(plans)} {plan.env_name} "
+                    f"({plan.usd_path})"
                 )
 
-                ok = await self.stage.switch_to(plan.usd_path)
+                ok = await self.stage.switch_to(
+                    plan.usd_path, timeout=load_timeout
+                )
                 if not ok:
                     msg = f"failed to load {plan.usd_path}"
                     carb.log_error(f"[BLV] collect_all: {msg}")

@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     import yaml  # type: ignore
@@ -67,6 +67,10 @@ class Defaults:
     asset_root_folder: str = ""
     environments_folder: str = ""
     location: str = ""
+
+    # Multi-class CLI (`blv-collect collect-classes`).  Empty list means
+    # fall back to ``asset_class_name`` (single-class legacy path).
+    classes: List[str] = field(default_factory=list)
 
     # --- Camera ---
     camera_path: str = "/World/BLV_Camera"
@@ -221,6 +225,16 @@ def load_config(
                     {k: bool(v) for k, v in yaml_annots.items() if k in merged}
                 )
             setattr(out, name, merged)
+            continue
+
+        # ``classes`` must be a list of strings.  A bare string is wrapped
+        # so users who write ``classes: handrail`` don't get cryptic errors.
+        if name == "classes":
+            yaml_classes = cfg.get("classes")
+            if isinstance(yaml_classes, list):
+                setattr(out, name, [str(x) for x in yaml_classes if x])
+            elif isinstance(yaml_classes, str) and yaml_classes:
+                setattr(out, name, [yaml_classes])
             continue
 
         # 1) YAML — respect explicit keys, even when they hold empty strings
